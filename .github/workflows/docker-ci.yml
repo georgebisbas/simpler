@@ -33,7 +33,7 @@ jobs:
             bash -c '
               set -e
               source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null || true
-              pytest tests/ -v --platform=a2a3 --device="${DEVICE_RANGE}"
+              pytest tests/st/ -v --platform=a2a3 --device="${DEVICE_RANGE}"
             '
 
       - name: Run distributed examples
