@@ -1,0 +1,50 @@
+name: Docker CI
+
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile.*'
+      - '.github/workflows/docker-ci.yml'
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-tests:
+    runs-on: [self-hosted, a2a3]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build Docker image
+        run: docker build -t simpler-ci:cann9 - < Dockerfile.simpler.cann9.0
+
+      - name: Run L2 tests
+        run: |
+          docker run --rm --privileged --ipc=host \
+            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+            -v /dev:/dev \
+            simpler-ci:cann9 \
+            bash -c '
+              set -e
+              source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null || true
+              pytest tests/ -v --platform=a2a3 --device="0,1,2,3"
+            '
+
+      - name: Run distributed examples
+        run: |
+          docker run --rm --privileged --ipc=host \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+            -v /dev:/dev \
+            simpler-ci:cann9 \
+            bash -c '
+              set -e
+              source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null || true
+              python examples/workers/l3/allreduce_distributed/main.py -p a2a3 -d 0-1
+              python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3 -d 0-1
+            '

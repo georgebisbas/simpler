@@ -65,3 +65,75 @@ python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install --no-build-isolation -e .
 ```
+
+---
+
+## Running via Docker (standalone image)
+
+The standalone Docker image requires nothing from your host except the Ascend
+kernel driver.  Everything else — CANN, simpler, pto-isa — is cloned and
+built inside the image.  No pypto dependency.
+
+### Build
+
+```bash
+docker build -t simpler-cann9 - < Dockerfile.simpler.cann9.0
+```
+
+To install under a custom prefix or pin a specific pto-isa commit:
+
+```bash
+docker build \
+  --build-arg INSTALL_PREFIX=/workspace \
+  --build-arg PTO_ISA_COMMIT=50d9c806 \
+  -t simpler-cann9 \
+  - < Dockerfile.simpler.cann9.0
+```
+
+### Run
+
+Single-device:
+
+```bash
+docker run --rm -it --privileged --ipc=host \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+  -v /dev:/dev \
+  simpler-cann9
+```
+
+Multi-device (HCCL / distributed):
+
+```bash
+docker run --rm -it --privileged --ipc=host \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+  -v /dev:/dev \
+  simpler-cann9
+```
+
+> **Important:** Do NOT mount `/usr/local/Ascend` from the host.  The image
+> already contains CANN 9.0.0.  Only the kernel driver at
+> `/usr/local/Ascend/driver` is needed.
+
+### HCCL hangs
+
+If multi-device examples stall during bootstrap, set the network interface:
+
+```bash
+docker run ... -e HCCL_SOCKET_IFNAME=lo simpler-cann9
+```
+
+### Common commands
+
+```bash
+cd /opt/simpler
+
+# L2 tests (real NPU)
+pytest tests/ -v --platform=a2a3 --device="0,1,2,3"
+
+# L3 distributed examples (multi-chip)
+python examples/workers/l3/allreduce_distributed/main.py -p a2a3 -d 0-1
+python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3 -d 0-1
+```

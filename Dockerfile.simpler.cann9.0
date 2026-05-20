@@ -1,0 +1,154 @@
+# Standalone simpler dev image for Ascend 910B
+#
+# No local files required — everything is cloned from GitHub at build time.
+# No build context needed; build from any directory.
+# No pypto dependency — clones and builds only simpler + pto-isa.
+#
+# All paths are driven by build args:
+#   CANN_VERSION    (default: 9.0.0)  — selects base image tag and all cann-* paths
+#   INSTALL_PREFIX  (default: /opt)   — root for simpler and pto-isa installs
+#   PTO_ISA_COMMIT  (default: auto)   — pto-isa commit; auto-derives from simpler's CI if not set
+#
+# REQUIREMENTS:
+#   - Internet access during build (GitHub)
+#   - Ascend 910B NPUs + host driver at runtime
+#   - CANN >= 9.0.0: libopapi.so must export aclnnShmemSdmaStarsQuery
+#     (absent in CANN 8.5.0) for comm_alloc_windows / SDMA workspace.
+#
+# SCOPE: real NPU execution only (a2a3 platform).
+#   Simulator mode (a2a3sim) is NOT supported — requires C++23 <format> / GCC 13+.
+#
+# BUILD:
+#   docker build -t simpler-cann9 - < Dockerfile.simpler.cann9.0
+#
+# BUILD (custom paths / pinned pto-isa):
+#   docker build --build-arg INSTALL_PREFIX=/workspace --build-arg PTO_ISA_COMMIT=50d9c806 -t simpler-cann9 - < Dockerfile.simpler.cann9.0
+#
+# RUN (single-device):
+#   docker run --rm -it --privileged --ipc=host -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /dev:/dev simpler-cann9
+#
+# RUN (multi-device, distributed / HCCL):
+#   docker run --rm -it --privileged --ipc=host --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /dev:/dev simpler-cann9
+#
+# NOTE: Do NOT mount /usr/local/Ascend — the image contains CANN baked in.
+#   Only the host kernel-driver user-space (/usr/local/Ascend/driver) is needed.
+#
+# TROUBLESHOOTING HCCL HANGS:
+#   If multi-device examples stall during bootstrap, set the network interface:
+#     docker run ... -e HCCL_SOCKET_IFNAME=lo simpler-cann9
+#
+# VERIFIED WORKING (4× Ascend 910B, driver v25.5.1, 2026-05-18):
+#   ✅ simpler L3 allreduce_distributed  (a2a3, 2-chip) → all ranks matched golden ✅
+#   ✅ simpler L3 ep_dispatch_combine    (a2a3, 2-chip) → all ranks matched golden ✅
+#   ✅ simpler L2 tests  (28/28, a2a3, devices 0-3)
+#
+# COMMON COMMANDS INSIDE CONTAINER (defaults: INSTALL_PREFIX=/opt, CANN_VERSION=9.0.0):
+#
+#   cd /opt/simpler
+#
+#   # Rebuild C++ extension after editing source (wheel is pre-installed at build):
+#   pip install --no-build-isolation .
+#
+#   # L2 tests (real NPU):
+#   pytest tests/ -v --platform=a2a3 --device="0,1,2,3"
+#
+#   # L3 distributed examples (multi-chip):
+#   python examples/workers/l3/allreduce_distributed/main.py -p a2a3 -d 0-1
+#   python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3 -d 0-1
+#   python examples/workers/l3/ffn_tp_parallel/main.py -p a2a3 -d 0-1
+#   python examples/workers/l3/multi_chip_dispatch/main.py -p a2a3 -d 0-1
+
+# ARG before FROM: drives the base image tag.
+ARG CANN_VERSION=9.0.0
+FROM quay.io/ascend/cann:${CANN_VERSION}-910b-ubuntu22.04-py3.12
+
+# Re-declare after FROM (ARG scope resets after each FROM).
+ARG CANN_VERSION=9.0.0
+ARG INSTALL_PREFIX=/opt
+# PTO_ISA_COMMIT defaults to empty — auto-derived from simpler's CI at build time.
+ARG PTO_ISA_COMMIT=
+
+# Persist as ENV so all subsequent instructions can reference them.
+ENV CANN_VERSION=${CANN_VERSION} \
+    INSTALL_PREFIX=${INSTALL_PREFIX}
+
+# Derived paths.
+ENV CANN_HOME=/usr/local/Ascend/cann-${CANN_VERSION}
+ENV SIMPLER_DIR=${INSTALL_PREFIX}/simpler \
+    PTO_ISA_DIR=${INSTALL_PREFIX}/pto-isa
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_CACHE_DIR=/tmp/pip-cache
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git curl ca-certificates \
+      build-essential cmake ninja-build pkg-config \
+      mpich libmpich-dev && \
+    if ! command -v g++-15 >/dev/null 2>&1; then \
+      ln -sf "$(command -v g++)" /usr/local/bin/g++-15; \
+    fi && \
+    if ! command -v gcc-15 >/dev/null 2>&1; then \
+      ln -sf "$(command -v gcc)" /usr/local/bin/gcc-15; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV CC=gcc-15 \
+    CXX=g++-15
+
+# Clone latest simpler from main (shallow).
+RUN git clone --depth 1 --branch main https://github.com/hw-native-sys/simpler.git "${SIMPLER_DIR}"
+
+WORKDIR ${SIMPLER_DIR}
+
+# Auto-derive PTO_ISA_COMMIT from simpler's own CI config if not overridden.
+# simpler's CI sets the canonical commit in the PTO_ISA_COMMIT env var.
+RUN if [ -z "${PTO_ISA_COMMIT}" ]; then \
+      PTO_ISA_COMMIT=$(grep -oP 'PTO_ISA_COMMIT:\s*\K[a-f0-9]+' .github/workflows/ci.yml | head -1); \
+      if [ -z "${PTO_ISA_COMMIT}" ]; then \
+        echo "ERROR: could not extract PTO_ISA_COMMIT from .github/workflows/ci.yml"; exit 1; \
+      fi; \
+      echo "Auto-derived PTO_ISA_COMMIT=${PTO_ISA_COMMIT} from ci.yml"; \
+    fi && \
+    git clone https://github.com/PTO-ISA/pto-isa.git "${PTO_ISA_DIR}" && \
+    git -C "${PTO_ISA_DIR}" checkout "${PTO_ISA_COMMIT}" && \
+    git -C "${PTO_ISA_DIR}" rev-parse --short HEAD
+
+ENV PTO_ISA_ROOT=${PTO_ISA_DIR}
+
+# Python build toolchain.
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    pip install \
+      "scikit-build-core>=0.10.0" \
+      "nanobind>=2.0.0" \
+      "ninja>=1.11.0" \
+      "cmake>=3.15"
+
+# Runtime / test dependencies.
+RUN pip install \
+      "numpy>=2.0" \
+      "pytest>=7.0.0" "pytest-forked>=1.0" "pytest-xdist==3.8.0" \
+      "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
+
+# Build and install simpler C++ extension.
+RUN rm -rf ./build && \
+    pip install --no-build-isolation .
+
+# Source CANN environment for every interactive shell.
+RUN echo "[ -f ${CANN_HOME}/set_env.sh ] && { source ${CANN_HOME}/set_env.sh 2>/dev/null || true; }" >> /etc/bash.bashrc
+
+ENV ASCEND_HOME_PATH=${CANN_HOME} \
+    PTO_TILE_LIB_CODE_PATH=${CANN_HOME} \
+    ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp \
+    MPI_HOME=/usr \
+    SIMPLER_ROOT=${SIMPLER_DIR} \
+    PTO_ISA_ROOT=${PTO_ISA_DIR}
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:${CANN_HOME}/aarch64-linux/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}
+ENV PYTHONPATH=${SIMPLER_DIR}/python:${SIMPLER_DIR}/examples/scripts
+ENV PYTHONPATH=${PYTHONPATH}:${CANN_HOME}/python/site-packages:${CANN_HOME}/opp/built-in/op_impl/ai_core/tbe
+ENV PYTHONPATH=${PYTHONPATH}:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe
+
+WORKDIR ${SIMPLER_DIR}
+CMD ["bash"]
