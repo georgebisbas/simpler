@@ -27,11 +27,13 @@ jobs:
             -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
             -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
             -v /dev:/dev \
+            -e HCCL_SOCKET_IFNAME=lo \
+            -e DEVICE_RANGE \
             simpler-ci:cann9 \
             bash -c '
               set -e
               source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null || true
-              pytest tests/ -v --platform=a2a3 --device="0,1,2,3"
+              pytest tests/ -v --platform=a2a3 --device="${DEVICE_RANGE}"
             '
 
       - name: Run distributed examples
@@ -41,10 +43,13 @@ jobs:
             -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
             -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
             -v /dev:/dev \
+            -e HCCL_SOCKET_IFNAME=lo \
+            -e DEVICE_RANGE \
             simpler-ci:cann9 \
             bash -c '
               set -e
               source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null || true
-              python examples/workers/l3/allreduce_distributed/main.py -p a2a3 -d 0-1
-              python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3 -d 0-1
+              DEVICES=(${DEVICE_RANGE//,/ })
+              python examples/workers/l3/allreduce_distributed/main.py -p a2a3 -d ${DEVICES[0]}-${DEVICES[1]}
+              python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3 -d ${DEVICES[0]}-${DEVICES[1]}
             '
