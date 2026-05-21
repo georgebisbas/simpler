@@ -117,14 +117,6 @@ docker run --rm -it --privileged --ipc=host \
 > already contains CANN 9.0.0.  Only the kernel driver at
 > `/usr/local/Ascend/driver` is needed.
 
-### HCCL hangs
-
-If multi-device examples stall during bootstrap, set the network interface:
-
-```bash
-docker run ... -e HCCL_SOCKET_IFNAME=lo simpler-cann9
-```
-
 ### Common commands
 
 ```bash

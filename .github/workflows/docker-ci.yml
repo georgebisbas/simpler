@@ -27,7 +27,6 @@ jobs:
             -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
             -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
             -v /dev:/dev \
-            -e HCCL_SOCKET_IFNAME=lo \
             -e DEVICE_RANGE \
             simpler-ci:cann9 \
             bash -c '
@@ -43,7 +42,6 @@ jobs:
             -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
             -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
             -v /dev:/dev \
-            -e HCCL_SOCKET_IFNAME=lo \
             -e DEVICE_RANGE \
             simpler-ci:cann9 \
             bash -c '
