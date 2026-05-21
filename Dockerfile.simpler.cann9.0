@@ -108,7 +108,8 @@ RUN if [ -z "${PTO_ISA_COMMIT}" ]; then \
       fi; \
       echo "Auto-derived PTO_ISA_COMMIT=${PTO_ISA_COMMIT} from ci.yml"; \
     fi && \
-    git clone https://github.com/PTO-ISA/pto-isa.git "${PTO_ISA_DIR}" && \
+    timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "${PTO_ISA_DIR}" \
+      || { rm -rf "${PTO_ISA_DIR}"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "${PTO_ISA_DIR}"; } && \
     git -C "${PTO_ISA_DIR}" checkout "${PTO_ISA_COMMIT}" && \
     git -C "${PTO_ISA_DIR}" rev-parse --short HEAD
 

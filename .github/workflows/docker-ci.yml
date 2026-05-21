@@ -18,6 +18,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Check NPU
+        run: npu-smi info
+
       - name: Build Docker image
         run: docker build -t simpler-ci:cann9 - < Dockerfile.simpler.cann9.0
 
