@@ -126,6 +126,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
     pipe_barrier(PIPE_ALL);
 
+    // Reentrant barrier cleanup: TWAIT has consumed this invocation's notifications.
+    // Reset local signal slots so the next invocation cannot pass on stale >=1 values.
+    for (int i = 0; i < nranks; ++i) {
+        signal_base[i] = 0;
+    }
+    pipe_barrier(PIPE_ALL);
+
     // ------------------------------------------------------------------
     // Phase 3: compute — sum every rank's scratch slot into accTile.
     // Start from my local scratch (no remote pointer needed), then add
