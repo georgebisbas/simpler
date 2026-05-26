@@ -119,20 +119,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
     pipe_barrier(PIPE_ALL);
 
-    // Reset signal slots — makes the barrier reentrant across multiple
-    // kernel invocations on the same HCCL window (e.g. a training loop).
-    //
-    // Safety argument:
-    //   signal_base[0..nranks-1] lives in OUR local window.  Peers write
-    //   to these slots via TNOTIFY (AtomicAdd).  The TWAIT loop above
-    //   returns only after each peer's write has been committed to our
-    //   local memory — no further DMA to signal_base[i] can arrive from
-    //   the current invocation once TWAIT(i) returns.  We are the sole
-    //   writer of our own signal_base; resetting to zero here (drained by
-    //   the pipe_barrier below) leaves the scratch region clean so that
-    //   the next invocation finds the expected initial state of zero
-    //   rather than the stale value of 1, which would cause TWAIT to
-    //   pass spuriously and skip synchronisation entirely.
+    // Reentrant barrier cleanup: TWAIT has consumed this invocation's notifications.
+    // Reset local signal slots so the next invocation cannot pass on stale >=1 values.
     for (int i = 0; i < nranks; ++i) {
         signal_base[i] = 0;
     }
