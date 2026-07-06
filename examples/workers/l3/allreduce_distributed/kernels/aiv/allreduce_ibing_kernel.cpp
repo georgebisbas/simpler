@@ -12,21 +12,11 @@
  * IBing Interleaved Bidirectional Ring AllReduce — faithful implementation
  * of the algorithm by Zong et al., ACM TACO 2025.
  *
- * Unlike the two-ring bidirectional_ring variant (which runs separate RS
- * and AG phases, 2(P-1)+1 barriers), this kernel implements the true
- * IBing interleaved schedule: P-1 bidirectional rounds, each round
- * pushing one chunk clockwise and one counter-clockwise, with the
- * first ⌊P/2⌋ steps using AtomicAdd (reduce-scatter) and the remaining
- * steps using AtomicNone (allgather-forward).
+ * P-1 bidirectional rounds with mixed AtomicAdd / AtomicNone phases.
+ * Verified for P=2 (no forward phase).
  *
- * Right-bound:  r pushes chunks[(r - s + P) % P]         → rank r+1
- * Left-bound:   r pushes chunks[(r + s + 1 + P) % P]    → rank r-1
- *
- * Exchange buffers snapshot source chunks before pushing on all platforms,
- * avoiding intra-round read/write races where a remote TPUT can modify a
- * chunk between the right-bound and left-bound TLOAD within the same step.
- * The double-barrier scheme ensures (a) prior writes are globally visible,
- * (b) all snapshots complete, before any push reads the exchange buffers.
+ * All bulk TLOAD/TSTORE/TPUT operations are tiled in TILE_CAP blocks to
+ * keep UB usage under 256 KB regardless of ALLREDUCE_COUNT.
  *
  * Scratch layout (per rank, in HCCL window):
  *   [0 .. P*chunk_elems)                   P working chunks
@@ -51,8 +41,9 @@
 #define __aicore__ [aicore]
 #endif
 
-static constexpr size_t ALLREDUCE_COUNT = 256;
+static constexpr size_t ALLREDUCE_COUNT = 1048576;
 static constexpr int kMaxSupportedRanks = 16;
+static constexpr size_t TILE_CAP = 4096;
 
 template <typename T>
 AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPtr, int pe) {
@@ -105,154 +96,144 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *exchange_left = exchange_right + static_cast<size_t>(chunk_elems);
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(exchange_left + static_cast<size_t>(chunk_elems));
 
-    ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
-    StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
-
+    using TileSub = pto::Tile<pto::TileType::Vec, float, 1, TILE_CAP, pto::BLayout::RowMajor, -1, -1>;
+    TileSub stageTile(1, TILE_CAP);
+    TASSIGN(stageTile, 0x0);
 #ifndef __CPU_SIM
-    using TilePush = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
-    TilePush pushTile(1, chunk_elems);
+    TileSub pushTile(1, TILE_CAP);
     TASSIGN(pushTile, 0x10000);
 #endif
 
-    using TileStage = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
-    TileStage stageTile(1, chunk_elems);
-    TASSIGN(stageTile, 0x0);
-
     // ------------------------------------------------------------------
     // Phase 1: stage-in — copy P chunks from input to scratch.
+    // Tiled: each chunk broken into TILE_CAP blocks.
     // ------------------------------------------------------------------
     for (int c = 0; c < nranks; ++c) {
-        __gm__ float *dst = chunks + static_cast<size_t>(c * chunk_elems);
-        __gm__ float *src = input + static_cast<size_t>(c * chunk_elems);
-        GT srcG(src, chunkShape, chunkStride);
-        GT dstG(dst, chunkShape, chunkStride);
-        TLOAD(stageTile, srcG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(dstG, stageTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        __gm__ float *base_dst = chunks + c * chunk_elems;
+        __gm__ float *base_src = input + c * chunk_elems;
+        for (int blk = 0; blk < chunk_elems; blk += (int)TILE_CAP) {
+            int cur = ((int)TILE_CAP < chunk_elems - blk) ? (int)TILE_CAP : (chunk_elems - blk);
+            __gm__ float *dst = base_dst + blk;
+            __gm__ float *src = base_src + blk;
+            ShapeDyn shape(1, 1, 1, 1, cur);
+            StrideDyn stride(cur, cur, cur, cur, 1);
+            GT srcG(src, shape, stride);
+            GT dstG(dst, shape, stride);
+            TLOAD(stageTile, srcG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            TSTORE(dstG, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        }
     }
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
     // Phase 2: IBing interleaved RS+AG — P−1 rounds.
-    //
-    // In each step s ∈ [1, P−1]:
-    //   - Push chunk (r - s + P) % P to right neighbour.
-    //   - Push chunk (r + s + 1 + P) % P to left neighbour.
-    //
-    //   Steps 1..⌊P/2⌋:     reduce  — AtomicAdd pushes from exchange buffers.
-    //   Steps ⌊P/2⌋+1..P−1: forward — AtomicNone pushes (allgather).
-    //
-    // CPU sim and NPU both use a double-barrier scheme:
-    //   1. Barrier A: ensure prior writes are globally visible.
-    //   2. Snapshot:  copy src chunks → exchange buffers.
-    //   3. Barrier B: ensure all snapshots complete.
-    //   4. Push:      write exchange buffers → neighbour's chunks[].
-    //
-    // This replicates MPI exchange-buffer semantics.  Without snapshots,
-    // a remote TPUT can modify chunks[idx_l] between the right-bound and
-    // left-bound TLOAD within the same step, double-counting data.
+    // Tiled: snapshot and both pushes done in TILE_CAP blocks.
     // ------------------------------------------------------------------
     const int left = (my_rank - 1 + nranks) % nranks;
     const int right = (my_rank + 1) % nranks;
     const int reduce_steps = nranks / 2;
 
     for (int step = 1; step < nranks; ++step) {
-        // Barrier A: all prior writes globally visible.
+        // Barrier A: prior writes globally visible.
         RoundBarrier(commCtx, signal_base + (2 * (step - 1)) * kMaxSupportedRanks, my_rank, nranks);
 
         const int idx_r = (my_rank - step + nranks) % nranks;
         const int idx_l = (my_rank + step + nranks + 1) % nranks;
         const bool fwd = (step > reduce_steps);
 
-        // Snapshot source chunks into exchange buffers.
-        //
-        // On NPU the snapshot stays on the MTE pipeline (TLOAD → TSTORE)
-        // so that pipe_barrier(PIPE_ALL) in the following RoundBarrier
-        // guarantees the exchange buffers are visible to subsequent MTE
-        // TLOADs inside TPUT.  Scalar-write snapshots are not flushed by
-        // PIPE_ALL and produce stale reads (zero accumulation).
-        //
-        // On CPU sim, scalar pointer writes into POSIX shm are sufficient
-        // because all ranks map the same physical pages and RoundBarrier's
-        // seq_cst atomics provide cross-process ordering.
+        // Snapshot source chunks into exchange buffers — tiled.
 #ifdef __CPU_SIM
-        for (int i = 0; i < chunk_elems; ++i)
-            exchange_right[i] = chunks[static_cast<size_t>(idx_r * chunk_elems) + i];
-        for (int i = 0; i < chunk_elems; ++i)
-            exchange_left[i] = chunks[static_cast<size_t>(idx_l * chunk_elems) + i];
-#else
-        // exchange_right ← chunks[idx_r]
-        {
-            __gm__ float *src_r = chunks + static_cast<size_t>(idx_r * chunk_elems);
-            GT srcG_r(src_r, chunkShape, chunkStride);
-            GT dstG_r(exchange_right, chunkShape, chunkStride);
-            TLOAD(stageTile, srcG_r);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            TSTORE(dstG_r, stageTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        for (int blk = 0; blk < chunk_elems; blk += (int)TILE_CAP) {
+            int cur = ((int)TILE_CAP < chunk_elems - blk) ? (int)TILE_CAP : (chunk_elems - blk);
+            __gm__ float *src_r = chunks + static_cast<size_t>(idx_r * chunk_elems + blk);
+            __gm__ float *src_l = chunks + static_cast<size_t>(idx_l * chunk_elems + blk);
+            for (int i = 0; i < cur; ++i) exchange_right[blk + i] = src_r[i];
+            for (int i = 0; i < cur; ++i) exchange_left[blk + i] = src_l[i];
         }
-        // exchange_left ← chunks[idx_l]
-        {
-            __gm__ float *src_l = chunks + static_cast<size_t>(idx_l * chunk_elems);
-            GT srcG_l(src_l, chunkShape, chunkStride);
-            GT dstG_l(exchange_left, chunkShape, chunkStride);
-            TLOAD(stageTile, srcG_l);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
-            TSTORE(dstG_l, stageTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+#else
+        for (int blk = 0; blk < chunk_elems; blk += (int)TILE_CAP) {
+            int cur = ((int)TILE_CAP < chunk_elems - blk) ? (int)TILE_CAP : (chunk_elems - blk);
+            ShapeDyn shape(1, 1, 1, 1, cur);
+            StrideDyn stride(cur, cur, cur, cur, 1);
+
+            // exchange_right ← chunks[idx_r]
+            {
+                __gm__ float *src_r = chunks + static_cast<size_t>(idx_r * chunk_elems + blk);
+                __gm__ float *dst_r = exchange_right + blk;
+                GT srcG(src_r, shape, stride);
+                GT dstG(dst_r, shape, stride);
+                TLOAD(stageTile, srcG);
+                set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+                TSTORE(dstG, stageTile);
+                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            }
+            // exchange_left ← chunks[idx_l]
+            {
+                __gm__ float *src_l = chunks + static_cast<size_t>(idx_l * chunk_elems + blk);
+                __gm__ float *dst_l = exchange_left + blk;
+                GT srcG(src_l, shape, stride);
+                GT dstG(dst_l, shape, stride);
+                TLOAD(stageTile, srcG);
+                set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+                TSTORE(dstG, stageTile);
+                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+            }
         }
         pipe_barrier(PIPE_ALL);
 #endif
 
-        // Barrier B: all snapshots complete — safe to push.
+        // Barrier B: all snapshots complete.
         RoundBarrier(commCtx, signal_base + (2 * (step - 1) + 1) * kMaxSupportedRanks, my_rank, nranks);
 
-        // Right-bound push.
-        {
+        // Right-bound push — tiled.
+        for (int blk = 0; blk < chunk_elems; blk += (int)TILE_CAP) {
+            int cur = ((int)TILE_CAP < chunk_elems - blk) ? (int)TILE_CAP : (chunk_elems - blk);
+            ShapeDyn shape(1, 1, 1, 1, cur);
+            StrideDyn stride(cur, cur, cur, cur, 1);
 #ifdef __CPU_SIM
-            __gm__ float *src = exchange_right;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
+            __gm__ float *src = exchange_right + blk;
+            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems + blk), right);
             if (fwd) {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] = src[i];
+                for (int i = 0; i < cur; ++i) dst[i] = src[i];
             } else {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] += src[i];
+                for (int i = 0; i < cur; ++i) dst[i] += src[i];
             }
 #else
-            __gm__ float *src = exchange_right;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
-            GT srcG(src, chunkShape, chunkStride);
-            GT dstG(dst, chunkShape, chunkStride);
+            __gm__ float *src = exchange_right + blk;
+            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems + blk), right);
+            GT srcG(src, shape, stride);
+            GT dstG(dst, shape, stride);
             if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
             else pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
 #endif
         }
 
-        // Left-bound push.
-        {
+        // Left-bound push — tiled.
+        for (int blk = 0; blk < chunk_elems; blk += (int)TILE_CAP) {
+            int cur = ((int)TILE_CAP < chunk_elems - blk) ? (int)TILE_CAP : (chunk_elems - blk);
+            ShapeDyn shape(1, 1, 1, 1, cur);
+            StrideDyn stride(cur, cur, cur, cur, 1);
 #ifdef __CPU_SIM
-            __gm__ float *src = exchange_left;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
+            __gm__ float *src = exchange_left + blk;
+            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems + blk), left);
             if (fwd) {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] = src[i];
+                for (int i = 0; i < cur; ++i) dst[i] = src[i];
             } else {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] += src[i];
+                for (int i = 0; i < cur; ++i) dst[i] += src[i];
             }
 #else
-            __gm__ float *src = exchange_left;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
-            GT srcG(src, chunkShape, chunkStride);
-            GT dstG(dst, chunkShape, chunkStride);
+            __gm__ float *src = exchange_left + blk;
+            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems + blk), left);
+            GT srcG(src, shape, stride);
+            GT dstG(dst, shape, stride);
             if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
             else pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
 #endif
@@ -261,27 +242,33 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         pipe_barrier(PIPE_ALL);
     }
 
-    // ------------------------------------------------------------------
-    // Final sync: ensure all pushes are globally visible before stage-out.
-    // ------------------------------------------------------------------
+    // Final sync barrier.
     if (nranks > 1) {
         RoundBarrier(commCtx, signal_base + (2 * (nranks - 1)) * kMaxSupportedRanks, my_rank, nranks);
     }
 
     // ------------------------------------------------------------------
     // Phase 3: stage-out — copy P fully-reduced chunks to output.
+    // Tiled same as stage-in.
     // ------------------------------------------------------------------
     for (int c = 0; c < nranks; ++c) {
-        __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems);
-        __gm__ float *src = chunks + static_cast<size_t>(c * chunk_elems);
-        GT srcG(src, chunkShape, chunkStride);
-        GT dstG(dst, chunkShape, chunkStride);
-        TLOAD(stageTile, srcG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(dstG, stageTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        __gm__ float *base_dst = output + c * chunk_elems;
+        __gm__ float *base_src = chunks + c * chunk_elems;
+        for (int blk = 0; blk < chunk_elems; blk += (int)TILE_CAP) {
+            int cur = ((int)TILE_CAP < chunk_elems - blk) ? (int)TILE_CAP : (chunk_elems - blk);
+            __gm__ float *dst = base_dst + blk;
+            __gm__ float *src = base_src + blk;
+            ShapeDyn shape(1, 1, 1, 1, cur);
+            StrideDyn stride(cur, cur, cur, cur, 1);
+            GT srcG(src, shape, stride);
+            GT dstG(dst, shape, stride);
+            TLOAD(stageTile, srcG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            TSTORE(dstG, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        }
     }
     pipe_barrier(PIPE_ALL);
 }

@@ -68,7 +68,7 @@ from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-ALLREDUCE_COUNT = 256
+ALLREDUCE_COUNT = 1048576
 DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
 
