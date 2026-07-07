@@ -42,7 +42,7 @@
 #define __aicore__ [aicore]
 #endif
 
-static constexpr size_t ALLREDUCE_COUNT = 1048576;
+static constexpr size_t ALLREDUCE_COUNT = 16777216;
 static constexpr int kMaxSupportedRanks = 16;
 static constexpr size_t TILE_CAP = 4096;
 

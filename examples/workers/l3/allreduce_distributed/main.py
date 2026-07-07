@@ -68,7 +68,7 @@ from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-ALLREDUCE_COUNT = 1048576
+ALLREDUCE_COUNT = 16777216
 DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
 
@@ -292,11 +292,17 @@ def run(
         worker.run(orch_fn, args=None, config=CallConfig())
 
         expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
+        # Float32-aware tolerance: values above 2^24 (≈16.7M) lose exact integer
+        # precision.  Different intermediate rounding paths (kernel TADD vs Python
+        # single-expression) can differ by a few ULPs without being incorrect.
+        max_expected = float(torch.max(torch.abs(expected)))
+        float32_ulp = max(1.0, max_expected / float(1 << 24))
+        tolerance = max(1e-3, 4.0 * float32_ulp)
         ok = True
         for i in range(nranks):
             max_diff = float(torch.max(torch.abs(host_outputs[i] - expected)))
             print(f"[allreduce] chip {i}: max |out - expected| = {max_diff:.3e}")
-            if max_diff > 1e-3:
+            if max_diff > tolerance:
                 ok = False
                 for j in range(min(4, ALLREDUCE_COUNT)):
                     print(f"  output[{j}]={float(host_outputs[i][j])!r} expected={float(expected[j])!r}")

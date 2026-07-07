@@ -42,7 +42,7 @@
 #define __aicore__ [aicore]
 #endif
 
-static constexpr size_t ALLREDUCE_COUNT = 1048576;
+static constexpr size_t ALLREDUCE_COUNT = 16777216;
 static constexpr int kMaxSupportedRanks = 16;
 // Max elements per single TLOAD/TSTORE — keeps UB usage well under 256 KB
 // even when multiple tiles coexist (e.g. chunkTile + recvTile = 2 × 16 KB).
