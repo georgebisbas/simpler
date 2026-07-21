@@ -20,7 +20,12 @@ from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, scene_test
 
-from .._helpers import allreduce_expected_output, allreduce_orch_fn, make_allreduce_args
+from .._helpers import (
+    CollectiveReduceOp,
+    allreduce_expected_output,
+    allreduce_orch_fn,
+    make_allreduce_args,
+)
 
 
 def _orch_entry(source, func_name, config_name=""):
@@ -95,15 +100,18 @@ class TestAllreduceOnephaseP2(SceneTestCase):
             "name": "onephase",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
             "config": {"device_count": 2},
-            "params": {"nranks": 2, "mode_id": 0},
+            "params": {"nranks": 2, "mode_id": 0, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -118,15 +126,18 @@ class TestAllreduceTwophaseP2(SceneTestCase):
             "name": "twophase",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
             "config": {"device_count": 2},
-            "params": {"nranks": 2, "mode_id": 1},
+            "params": {"nranks": 2, "mode_id": 1, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -141,15 +152,18 @@ class TestAllreduceRingP2(SceneTestCase):
             "name": "ring",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
             "config": {"device_count": 2},
-            "params": {"nranks": 2, "mode_id": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -164,15 +178,18 @@ class TestAllreduceBidirectionalRingP2(SceneTestCase):
             "name": "bidirectional_ring",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
             "config": {"device_count": 2},
-            "params": {"nranks": 2, "mode_id": 3},
+            "params": {"nranks": 2, "mode_id": 3, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -187,15 +204,18 @@ class TestAllreduceIbingP2(SceneTestCase):
             "name": "ibing",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
             "config": {"device_count": 2},
-            "params": {"nranks": 2, "mode_id": 4},
+            "params": {"nranks": 2, "mode_id": 4, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -210,15 +230,18 @@ class TestAllreduceOnephaseP4(SceneTestCase):
             "name": "onephase",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 4},
-            "params": {"nranks": 4, "mode_id": 0},
+            "params": {"nranks": 4, "mode_id": 0, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -233,15 +256,18 @@ class TestAllreduceTwophaseP4(SceneTestCase):
             "name": "twophase",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 4},
-            "params": {"nranks": 4, "mode_id": 1},
+            "params": {"nranks": 4, "mode_id": 1, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -256,15 +282,18 @@ class TestAllreduceRingP4(SceneTestCase):
             "name": "ring",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 4},
-            "params": {"nranks": 4, "mode_id": 2},
+            "params": {"nranks": 4, "mode_id": 2, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -279,15 +308,18 @@ class TestAllreduceBidirectionalRingP4(SceneTestCase):
             "name": "bidirectional_ring",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 4},
-            "params": {"nranks": 4, "mode_id": 3},
+            "params": {"nranks": 4, "mode_id": 3, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
-        expected = torch.tensor(allreduce_expected_output(params["nranks"]), dtype=torch.float32)
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
         for rank in range(params["nranks"]):
             getattr(args, f"out_{rank}").copy_(expected)
 
@@ -302,12 +334,12 @@ class TestAllreduceIbingNranksError(SceneTestCase):
             "name": "ibing_nranks_4",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 4},
-            "params": {"nranks": 4, "mode_id": 4},
+            "params": {"nranks": 4, "mode_id": 4, "reduce_op": 0},
         }
     ]
 
     def generate_args(self, params):
-        return make_allreduce_args(params["nranks"], params["mode_id"])
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
 
     def compute_golden(self, args, params):
         pass
@@ -316,6 +348,82 @@ class TestAllreduceIbingNranksError(SceneTestCase):
         """Override: expect ValueError from orch_fn before any submission."""
         with pytest.raises(ValueError, match="ibing mode is only supported for nranks=2"):
             super().test_run(st_platform, st_worker, request)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceOnephaseP2MaxMinProd(SceneTestCase):
+    """Allreduce onephase — 2-rank, non-Sum reduce ops."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "onephase_max",
+            "platforms": ["a2a3sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 0, "reduce_op": 1},
+        },
+        {
+            "name": "onephase_min",
+            "platforms": ["a2a3sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 0, "reduce_op": 2},
+        },
+        {
+            "name": "onephase_prod",
+            "platforms": ["a2a3sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 0, "reduce_op": 3},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceRingP2MaxMinProd(SceneTestCase):
+    """Allreduce ring — 2-rank, non-Sum reduce ops."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "ring_max",
+            "platforms": ["a2a3sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 1},
+        },
+        {
+            "name": "ring_min",
+            "platforms": ["a2a3sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 2},
+        },
+        {
+            "name": "ring_prod",
+            "platforms": ["a2a3sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 3},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"])),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
 
 
 if __name__ == "__main__":
