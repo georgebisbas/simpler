@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <functional>
 #include <memory>
@@ -59,6 +60,27 @@ constexpr int SIM_COMM_TIMEOUT_SECONDS = 120;
 constexpr int FTRUNCATE_POLL_INTERVAL_US = 1000;
 constexpr int BARRIER_POLL_INTERVAL_US = 50;
 constexpr int DESTROY_POLL_INTERVAL_US = 1000;
+
+// Self-notify sinkhole: resolved from libcpu_sim_context.so at runtime
+// (dlsym so this backend also builds without that SO present).
+using RegisterSelfWindowFn = void (*)(uint64_t, uint64_t);
+using UnregisterSelfWindowFn = void (*)(uint64_t);
+inline RegisterSelfWindowFn ResolveRegisterSelfWindow() {
+    static auto fn = reinterpret_cast<RegisterSelfWindowFn>(
+        dlsym(RTLD_DEFAULT, "pto_sim_register_self_window"));
+    return fn;
+}
+inline UnregisterSelfWindowFn ResolveUnregisterSelfWindow() {
+    static auto fn = reinterpret_cast<UnregisterSelfWindowFn>(
+        dlsym(RTLD_DEFAULT, "pto_sim_unregister_self_window"));
+    return fn;
+}
+inline void RegisterSelfWindow(uint64_t base, uint64_t size) {
+    if (auto fn = ResolveRegisterSelfWindow()) fn(base, size);
+}
+inline void UnregisterSelfWindow(uint64_t base) {
+    if (auto fn = ResolveUnregisterSelfWindow()) fn(base);
+}
 
 // macOS's PSHMNAMLEN is 31 (name length excluding the null terminator).  Linux
 // accepts up to NAME_MAX (255), but we pick the tighter value so the same
@@ -586,6 +608,10 @@ extern "C" int comm_alloc_domain_windows(
         ctx.windowsOut[i] = addr;
     }
 
+    // Register this rank's own slice so a kernel that (incorrectly) TNOTIFYs
+    // its own window fails in sim exactly as on real NPU (self-notify no-op).
+    RegisterSelfWindow(ctx.windowsIn[domain_rank], window_size);
+
     // Zero this rank's local window so scratch/signal protocols see a known
     // initial state — matches the static-bootstrap contract (which zeroed
     // the base window after alloc).  Kernels on HCCL must not observe
@@ -654,6 +680,9 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     }
     int rc = 0;
     if (alloc->mmap_base != nullptr) {
+        // Unregister the self-window sinkhole before unmapping.
+        UnregisterSelfWindow(alloc->host_ctx->windowsIn[alloc->rank]);
+
         auto *hdr = static_cast<SharedHeader *>(alloc->mmap_base);
         int gone = __atomic_add_fetch(&hdr->destroy_count, 1, __ATOMIC_ACQ_REL);
         if (gone >= alloc->nranks) {
@@ -698,6 +727,7 @@ extern "C" int comm_destroy(CommHandle h) try {
     for (auto &kv : h->domain_allocations) {
         auto &alloc = kv.second;
         if (alloc->mmap_base != nullptr) {
+            UnregisterSelfWindow(alloc->host_ctx->windowsIn[alloc->rank]);
             munmap(alloc->mmap_base, alloc->mmap_size);
             shm_unlink(alloc->shm_name.c_str());
         }

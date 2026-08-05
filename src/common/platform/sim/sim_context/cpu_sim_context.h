@@ -55,6 +55,13 @@ uint32_t pto_sim_get_subblock_id(void);
  */
 void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size);
 
+// Self-notify sinkhole: mirrors onboard NPU where a TNOTIFY whose destination
+// is the sender's own window is a no-op.  The pto-isa CPU TNOTIFY drops writes
+// that fall inside a registered range; comm_sim registers the rank's own slice.
+void pto_sim_register_self_window(uint64_t base, uint64_t size);
+void pto_sim_unregister_self_window(uint64_t base);
+bool pto_sim_is_self_notify_sinkhole(uint64_t addr);
+
 #ifdef __cplusplus
 }
 #endif

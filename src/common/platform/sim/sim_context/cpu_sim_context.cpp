@@ -42,6 +42,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -69,6 +70,16 @@ struct DeviceSimContext {
     std::mutex pipe_state_mutex;
     std::unordered_map<PipeStateKey, void *, PipeStateKeyHash> pipe_states;
 };
+
+// Process-global self-notify sinkhole ranges.  Each sim rank is a separate
+// process; registering this rank's own window slice lets the CPU-sim TNOTIFY
+// drop self-destination writes (mirroring onboard NPU) while genuine peer-slice
+// TNOTIFYs are untouched.  Process-global (rather than per-device) because
+// window registration happens on the host-side ChipWorker thread (not device-
+// bound), while the TNOTIFY query runs on the device-bound worker thread.
+struct SelfWindowRange { uint64_t base; uint64_t size; };
+std::mutex g_self_window_mutex;
+std::vector<SelfWindowRange> g_self_windows;
 
 std::mutex g_registry_mutex;
 std::unordered_map<int, DeviceSimContext *> g_device_contexts;
@@ -261,4 +272,29 @@ extern "C" void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size) {
     void *storage = std::calloc(1, size);
     dev->pipe_states.emplace(key, storage);
     return storage;
+}
+
+// ---------------------------------------------------------------------------
+// Self-notify sinkhole registry (resolved by pto-isa CPU TNOTIFY)
+// ---------------------------------------------------------------------------
+
+extern "C" void pto_sim_register_self_window(uint64_t base, uint64_t size) {
+    if (size == 0) return;
+    std::lock_guard<std::mutex> lock(g_self_window_mutex);
+    g_self_windows.push_back(SelfWindowRange{base, size});
+}
+
+extern "C" void pto_sim_unregister_self_window(uint64_t base) {
+    std::lock_guard<std::mutex> lock(g_self_window_mutex);
+    for (auto it = g_self_windows.begin(); it != g_self_windows.end(); ++it) {
+        if (it->base == base) { g_self_windows.erase(it); return; }
+    }
+}
+
+extern "C" bool pto_sim_is_self_notify_sinkhole(uint64_t addr) {
+    std::lock_guard<std::mutex> lock(g_self_window_mutex);
+    for (const auto &r : g_self_windows) {
+        if (addr >= r.base && addr < r.base + r.size) return true;
+    }
+    return false;
 }
