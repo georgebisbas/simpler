@@ -676,6 +676,11 @@ assert _DOMAIN_REPLY_HEADER.size == 32
 # zero-filled, so an unwritten slot reads as not committed.
 _OFF_DOMAIN_REPLY_COMMITTED = 0
 
+# Cache-line alignment for window sub-buffers. NPU comm primitives (TWait,
+# TNotify) operate on whole 64-byte cache lines; back-to-back buffers sharing
+# a line can corrupt each other. Set SIMPLER_WINDOW_BUFFER_ALIGN=1 to disable.
+_WINDOW_BUFFER_ALIGN = int(os.environ.get("SIMPLER_WINDOW_BUFFER_ALIGN", "64"))
+
 # Control args layout (reuses task mailbox fields when state == _CONTROL_*):
 #   offset  8 (_OFF_CALLABLE):  uint64  sub-command
 #   offset 16:                  uint64  arg0 (size for malloc/register; ptr for free; region id)
@@ -2411,10 +2416,18 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
         )
 
-        # Carve buffer pointers sequentially inside the local window.
+        # Carve buffer pointers sequentially inside the local window, aligning
+        # each to _WINDOW_BUFFER_ALIGN (default 64 B = cache line). The NPU comm
+        # primitives (TWait dcci spin, TNotify dcci; store; dcci) operate on
+        # whole cache lines, so adjacent buffers sharing a line can corrupt.
         buffer_ptrs: list[int] = []
         offset = 0
+        align = _WINDOW_BUFFER_ALIGN
         for nbytes in buffer_nbytes:
+            # Align offset before placing this buffer (except the first, which
+            # starts at 0 and is already aligned to whatever the window base is).
+            if buffer_ptrs and align > 1:
+                offset = (offset + align - 1) // align * align
             if offset + nbytes > window_size:
                 raise ValueError(
                     f"alloc_domain: buffer #{len(buffer_ptrs)} (nbytes={nbytes}) at offset={offset} "
