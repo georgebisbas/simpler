@@ -64,31 +64,31 @@ _ALLREDUCE_MODE_NAMES = ["onephase", "twophase", "ring", "bidirectional_ring", "
 def _allreduce_scratch_params(mode: str, nranks: int, count: int | None = None) -> tuple[int, int, int]:
     """Compute (float_elems, scratch_nbytes, window_size) for an allreduce mode.
 
-    ``count`` overrides ``ALLREDUCE_COUNT`` for ``onephase``, whose kernel takes
-    the element count as a runtime scalar; every other mode still runs at the
-    fixed ``ALLREDUCE_COUNT``.
+    ``count`` overrides the fixed ``ALLREDUCE_COUNT`` for every mode — all five
+    kernels take the element count as a runtime scalar.
     """
+    c = ALLREDUCE_COUNT if count is None else count
     if mode == "onephase":
-        float_elems = ALLREDUCE_COUNT if count is None else count
+        float_elems = c
         scratch_nbytes = float_elems * ALLREDUCE_DTYPE_NBYTES + ALLREDUCE_MAX_RANKS * ALLREDUCE_DTYPE_NBYTES
     elif mode == "twophase":
-        chunk_elems = ALLREDUCE_COUNT // nranks
+        chunk_elems = c // nranks
         float_elems = nranks * chunk_elems
         scratch_nbytes = float_elems * ALLREDUCE_DTYPE_NBYTES + 2 * ALLREDUCE_MAX_RANKS * ALLREDUCE_DTYPE_NBYTES
     elif mode == "ring":
-        chunk_elems = ALLREDUCE_COUNT // nranks
+        chunk_elems = c // nranks
         float_elems = (nranks + 1) * chunk_elems
         scratch_nbytes = (
             float_elems * ALLREDUCE_DTYPE_NBYTES + 2 * (nranks - 1) * ALLREDUCE_MAX_RANKS * ALLREDUCE_DTYPE_NBYTES
         )
     elif mode == "bidirectional_ring":
-        subchunk_elems = ALLREDUCE_COUNT // (2 * nranks)
-        float_elems = 2 * nranks * subchunk_elems  # = ALLREDUCE_COUNT
+        subchunk_elems = c // (2 * nranks)
+        float_elems = 2 * nranks * subchunk_elems  # = c
         scratch_nbytes = (
             float_elems * ALLREDUCE_DTYPE_NBYTES + (2 * (nranks - 1) + 1) * ALLREDUCE_MAX_RANKS * ALLREDUCE_DTYPE_NBYTES
         )
     elif mode == "ibing":
-        chunk_elems = ALLREDUCE_COUNT // nranks
+        chunk_elems = c // nranks
         float_elems = (nranks + 2) * chunk_elems
         scratch_nbytes = (
             float_elems * ALLREDUCE_DTYPE_NBYTES
@@ -109,9 +109,9 @@ def _allreduce_scratch_params(mode: str, nranks: int, count: int | None = None) 
 def allreduce_orch_fn(orch, callables, task_args, config):
     """L3 orch: allocate a domain and submit all allreduce ranks as one group.
 
-    Reads nranks, mode_id, and optional reduce_op from task_args
-    scalars. Selects the ChipCallable by mode name (e.g.
-    ``allreduce_onephase``).
+    Reads nranks, mode_id, optional reduce_op, and optional count from
+    task_args scalars (count defaults to ALLREDUCE_COUNT). Selects the
+    ChipCallable by mode name (e.g. ``allreduce_onephase``).
     """
     nranks = int(task_args.nranks.value)
     if not (2 <= nranks <= ALLREDUCE_MAX_RANKS):
@@ -128,19 +128,18 @@ def allreduce_orch_fn(orch, callables, task_args, config):
     except ValueError as exc:
         raise ValueError(f"invalid allreduce reduce_op: {reduce_op_val}") from exc
 
+    count_val = int(task_args.count.value) if hasattr(task_args, "count") else ALLREDUCE_COUNT
+
     # ibing is only supported for P=2
     if mode == "ibing" and nranks != 2:
         raise ValueError(f"ibing mode is only supported for nranks=2, got nranks={nranks}")
-    # Chunked modes require ALLREDUCE_COUNT divisible by nranks (or 2*nranks).
-    if mode in ("twophase", "ring", "ibing") and ALLREDUCE_COUNT % nranks != 0:
-        raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={nranks} for {mode} mode")
-    if mode == "bidirectional_ring" and ALLREDUCE_COUNT % (2 * nranks) != 0:
-        raise ValueError(
-            f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by 2*nranks={2 * nranks} for {mode} mode"
-        )
+    # Chunked modes require count divisible by nranks (or 2*nranks).
+    if mode in ("twophase", "ring", "ibing") and count_val % nranks != 0:
+        raise ValueError(f"count={count_val} must be divisible by nranks={nranks} for {mode} mode")
+    if mode == "bidirectional_ring" and count_val % (2 * nranks) != 0:
+        raise ValueError(f"count={count_val} must be divisible by 2*nranks={2 * nranks} for {mode} mode")
 
     chip = getattr(callables, f"allreduce_{mode}")
-    count_val = int(task_args.count.value) if hasattr(task_args, "count") else None
     float_elems, scratch_nbytes, window_size = _allreduce_scratch_params(mode, nranks, count_val)
 
     with orch.allocate_domain(
@@ -161,8 +160,7 @@ def allreduce_orch_fn(orch, callables, task_args, config):
             chip_args.add_scalar(domain.domain_size)
             chip_args.add_scalar(domain.device_ctx)
             chip_args.add_scalar(reduce_op_val)
-            if mode == "onephase":
-                chip_args.add_scalar(count_val if count_val is not None else ALLREDUCE_COUNT)
+            chip_args.add_scalar(count_val)
             args_list.append(chip_args)
         orch.submit_next_level_group(chip, args_list, config, workers=list(range(nranks)))
 

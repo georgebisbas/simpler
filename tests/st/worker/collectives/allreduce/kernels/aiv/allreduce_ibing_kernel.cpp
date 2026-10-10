@@ -41,7 +41,13 @@
  *   tail + ...                             reserved SDMA workspace bytes
  *                                          (sim / future NPU async path)
  *
- * Divisibility: requires ALLREDUCE_COUNT % nranks == 0.
+ * Divisibility: requires count % nranks == 0.
+ *
+ * The element count is a runtime scalar (args[6]): each per-rank chunk
+ * (count/nranks elements) is processed in fixed kChunkCols-wide tiles, with
+ * the loop trip count set by the runtime value instead of being fully
+ * unrolled at compile time. Round counts are unaffected — they depend only
+ * on nranks.
  */
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -63,8 +69,9 @@
 #define __aicore__ [aicore]
 #endif
 
-static constexpr size_t ALLREDUCE_COUNT = 256;
 static constexpr int kMaxSupportedRanks = 16;
+// UB tile slot size: TASSIGN spacing is 0x10000 bytes -> 16384 float32 columns per tile.
+static constexpr int kChunkCols = 16384;
 static constexpr size_t kSdmaWorkspaceSize = 16 * 1024;
 #if defined(__CPU_SIM) || defined(__COSTMODEL)
 static constexpr int kMaxAsyncEvents = 8;
@@ -131,6 +138,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int nranks = static_cast<int>(args[3]);
     __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[4]);
     CollectiveReduceOp reduce_op = static_cast<CollectiveReduceOp>(args[5]);
+    int count = static_cast<int>(args[6]);
     // TPUT<AtomicAdd> only supports Sum reduction.
     if (reduce_op != CollectiveReduceOp::kSum) {
         pipe_barrier(PIPE_ALL);
@@ -148,12 +156,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int my_rank = static_cast<int>(commCtx->rankId);
 
-    if (nranks <= 1 || nranks > kMaxSupportedRanks || (ALLREDUCE_COUNT % static_cast<size_t>(nranks)) != 0) {
+    if (nranks <= 1 || nranks > kMaxSupportedRanks || count <= 0 || (count % nranks) != 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
 
-    const int chunk_elems = static_cast<int>(ALLREDUCE_COUNT / static_cast<size_t>(nranks));
+    const int chunk_elems = count / nranks;
     __gm__ float *chunks = scratch;
     __gm__ float *exchange_right = scratch + static_cast<size_t>(nranks * chunk_elems);
     __gm__ float *exchange_left = exchange_right + static_cast<size_t>(chunk_elems);
@@ -173,31 +181,36 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     (void)kSdmaWorkspaceSize;
 #endif
 
-    ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
     StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
 
-    using TilePush = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
-    TilePush pushTile(1, chunk_elems);
+    using TilePush = pto::Tile<pto::TileType::Vec, float, 1, kChunkCols, pto::BLayout::RowMajor, -1, -1>;
+    TilePush pushTile(1, kChunkCols);
     TASSIGN(pushTile, 0x10000);
 
-    using TileStage = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
-    TileStage stageTile(1, chunk_elems);
+    using TileStage = pto::Tile<pto::TileType::Vec, float, 1, kChunkCols, pto::BLayout::RowMajor, -1, -1>;
+    TileStage stageTile(1, kChunkCols);
     TASSIGN(stageTile, 0x0);
 
     // ------------------------------------------------------------------
-    // Phase 1: stage-in — copy P chunks from input to scratch.
+    // Phase 1: stage-in — copy P chunks from input to scratch, kChunkCols
+    // elements at a time.
     // ------------------------------------------------------------------
     for (int c = 0; c < nranks; ++c) {
-        __gm__ float *dst = chunks + static_cast<size_t>(c * chunk_elems);
-        __gm__ float *src = input + static_cast<size_t>(c * chunk_elems);
-        GT srcG(src, chunkShape, chunkStride);
-        GT dstG(dst, chunkShape, chunkStride);
-        TLOAD(stageTile, srcG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(dstG, stageTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        for (int off = 0; off < chunk_elems; off += kChunkCols) {
+            int cc = (chunk_elems - off < kChunkCols) ? (chunk_elems - off) : kChunkCols;
+            stageTile.ColMaskInternal = cc;
+            ShapeDyn chunkShape(1, 1, 1, 1, cc);
+            __gm__ float *dst = chunks + static_cast<size_t>(c * chunk_elems + off);
+            __gm__ float *src = input + static_cast<size_t>(c * chunk_elems + off);
+            GT srcG(src, chunkShape, chunkStride);
+            GT dstG(dst, chunkShape, chunkStride);
+            TLOAD(stageTile, srcG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            TSTORE(dstG, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        }
     }
     pipe_barrier(PIPE_ALL);
 
@@ -219,36 +232,42 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         const int idx_l = (my_rank + step + nranks + 1) % nranks;
         const bool fwd = (step > reduce_steps);
 
-        // Snapshot source chunks into exchange buffers.
+        // Snapshot source chunks into exchange buffers, kChunkCols elements
+        // at a time.
 #ifdef __CPU_SIM
         for (int i = 0; i < chunk_elems; ++i)
             exchange_right[i] = chunks[static_cast<size_t>(idx_r * chunk_elems) + i];
         for (int i = 0; i < chunk_elems; ++i)
             exchange_left[i] = chunks[static_cast<size_t>(idx_l * chunk_elems) + i];
 #else
-        // exchange_right ← chunks[idx_r]
-        {
-            __gm__ float *src_r = chunks + static_cast<size_t>(idx_r * chunk_elems);
-            GT srcG_r(src_r, chunkShape, chunkStride);
-            GT dstG_r(exchange_right, chunkShape, chunkStride);
-            TLOAD(stageTile, srcG_r);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            TSTORE(dstG_r, stageTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        }
-        // exchange_left ← chunks[idx_l]
-        {
-            __gm__ float *src_l = chunks + static_cast<size_t>(idx_l * chunk_elems);
-            GT srcG_l(src_l, chunkShape, chunkStride);
-            GT dstG_l(exchange_left, chunkShape, chunkStride);
-            TLOAD(stageTile, srcG_l);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
-            TSTORE(dstG_l, stageTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+        for (int off = 0; off < chunk_elems; off += kChunkCols) {
+            int cc = (chunk_elems - off < kChunkCols) ? (chunk_elems - off) : kChunkCols;
+            stageTile.ColMaskInternal = cc;
+            ShapeDyn chunkShape(1, 1, 1, 1, cc);
+            // exchange_right ← chunks[idx_r]
+            {
+                __gm__ float *src_r = chunks + static_cast<size_t>(idx_r * chunk_elems + off);
+                GT srcG_r(src_r, chunkShape, chunkStride);
+                GT dstG_r(exchange_right + off, chunkShape, chunkStride);
+                TLOAD(stageTile, srcG_r);
+                set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+                TSTORE(dstG_r, stageTile);
+                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            }
+            // exchange_left ← chunks[idx_l]
+            {
+                __gm__ float *src_l = chunks + static_cast<size_t>(idx_l * chunk_elems + off);
+                GT srcG_l(src_l, chunkShape, chunkStride);
+                GT dstG_l(exchange_left + off, chunkShape, chunkStride);
+                TLOAD(stageTile, srcG_l);
+                set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+                TSTORE(dstG_l, stageTile);
+                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+            }
         }
         pipe_barrier(PIPE_ALL);
 #endif
@@ -257,62 +276,78 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         RoundBarrier(commCtx, signal_base + (2 * (step - 1) + 1) * kMaxSupportedRanks, my_rank, nranks);
 
         if (fwd) {
+            for (int off = 0; off < chunk_elems; off += kChunkCols) {
+                int cc = (chunk_elems - off < kChunkCols) ? (chunk_elems - off) : kChunkCols;
+                pushTile.ColMaskInternal = cc;
+                ShapeDyn chunkShape(1, 1, 1, 1, cc);
 #if defined(__CPU_SIM) || defined(__COSTMODEL)
-            // Forward step: TPUT_ASYNC for both CW and CCW pushes (sim API path).
-            asyncS.Reset();
+                // Forward step: TPUT_ASYNC for both CW and CCW pushes (sim API path).
+                asyncS.Reset();
 
-            {
-                __gm__ float *src = exchange_right;
-                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
-                GT srcG(src, chunkShape, chunkStride);
-                GT dstG(dst, chunkShape, chunkStride);
-                pto::comm::AsyncEvent ev = pto::comm::TPUT_ASYNC(dstG, srcG, asyncS.session);
-                asyncS.Issue(ev);
-            }
+                {
+                    __gm__ float *src = exchange_right + off;
+                    __gm__ float *dst =
+                        CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems + off), right);
+                    GT srcG(src, chunkShape, chunkStride);
+                    GT dstG(dst, chunkShape, chunkStride);
+                    pto::comm::AsyncEvent ev = pto::comm::TPUT_ASYNC(dstG, srcG, asyncS.session);
+                    asyncS.Issue(ev);
+                }
 
-            {
-                __gm__ float *src = exchange_left;
-                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
-                GT srcG(src, chunkShape, chunkStride);
-                GT dstG(dst, chunkShape, chunkStride);
-                pto::comm::AsyncEvent ev = pto::comm::TPUT_ASYNC(dstG, srcG, asyncS.session);
-                asyncS.Issue(ev);
-            }
+                {
+                    __gm__ float *src = exchange_left + off;
+                    __gm__ float *dst =
+                        CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems + off), left);
+                    GT srcG(src, chunkShape, chunkStride);
+                    GT dstG(dst, chunkShape, chunkStride);
+                    pto::comm::AsyncEvent ev = pto::comm::TPUT_ASYNC(dstG, srcG, asyncS.session);
+                    asyncS.Issue(ev);
+                }
 
-            asyncS.WaitAll();
+                asyncS.WaitAll();
 #else
-            // NPU: synchronous AtomicNone (SDMA async not yet loader-safe).
-            {
-                __gm__ float *src = exchange_right;
-                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
-                GT srcG(src, chunkShape, chunkStride);
-                GT dstG(dst, chunkShape, chunkStride);
-                pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
-            }
-            {
-                __gm__ float *src = exchange_left;
-                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
-                GT srcG(src, chunkShape, chunkStride);
-                GT dstG(dst, chunkShape, chunkStride);
-                pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+                // NPU: synchronous AtomicNone (SDMA async not yet loader-safe).
+                {
+                    __gm__ float *src = exchange_right + off;
+                    __gm__ float *dst =
+                        CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems + off), right);
+                    GT srcG(src, chunkShape, chunkStride);
+                    GT dstG(dst, chunkShape, chunkStride);
+                    pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+                }
+                {
+                    __gm__ float *src = exchange_left + off;
+                    __gm__ float *dst =
+                        CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems + off), left);
+                    GT srcG(src, chunkShape, chunkStride);
+                    GT dstG(dst, chunkShape, chunkStride);
+                    pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+                }
+#endif
             }
             pipe_barrier(PIPE_ALL);
-#endif
         } else {
             // Reduce step: synchronous TPUT<AtomicAdd>.
-            {
-                __gm__ float *src = exchange_right;
-                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
-                GT srcG(src, chunkShape, chunkStride);
-                GT dstG(dst, chunkShape, chunkStride);
-                pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-            }
-            {
-                __gm__ float *src = exchange_left;
-                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
-                GT srcG(src, chunkShape, chunkStride);
-                GT dstG(dst, chunkShape, chunkStride);
-                pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+            for (int off = 0; off < chunk_elems; off += kChunkCols) {
+                int cc = (chunk_elems - off < kChunkCols) ? (chunk_elems - off) : kChunkCols;
+                pushTile.ColMaskInternal = cc;
+                ShapeDyn chunkShape(1, 1, 1, 1, cc);
+                {
+                    __gm__ float *src = exchange_right + off;
+                    __gm__ float *dst =
+                        CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems + off), right);
+                    GT srcG(src, chunkShape, chunkStride);
+                    GT dstG(dst, chunkShape, chunkStride);
+                    pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+                }
+                {
+                    __gm__ float *src = exchange_left + off;
+                    __gm__ float *dst =
+                        CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems + off), left);
+                    GT srcG(src, chunkShape, chunkStride);
+                    GT dstG(dst, chunkShape, chunkStride);
+                    pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+                }
             }
             pipe_barrier(PIPE_ALL);
         }
@@ -326,19 +361,25 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
 
     // ------------------------------------------------------------------
-    // Phase 3: stage-out — copy P fully-reduced chunks to output.
+    // Phase 3: stage-out — copy P fully-reduced chunks to output,
+    // kChunkCols elements at a time.
     // ------------------------------------------------------------------
     for (int c = 0; c < nranks; ++c) {
-        __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems);
-        __gm__ float *src = chunks + static_cast<size_t>(c * chunk_elems);
-        GT srcG(src, chunkShape, chunkStride);
-        GT dstG(dst, chunkShape, chunkStride);
-        TLOAD(stageTile, srcG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(dstG, stageTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        for (int off = 0; off < chunk_elems; off += kChunkCols) {
+            int cc = (chunk_elems - off < kChunkCols) ? (chunk_elems - off) : kChunkCols;
+            stageTile.ColMaskInternal = cc;
+            ShapeDyn chunkShape(1, 1, 1, 1, cc);
+            __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems + off);
+            __gm__ float *src = chunks + static_cast<size_t>(c * chunk_elems + off);
+            GT srcG(src, chunkShape, chunkStride);
+            GT dstG(dst, chunkShape, chunkStride);
+            TLOAD(stageTile, srcG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            TSTORE(dstG, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        }
     }
     pipe_barrier(PIPE_ALL);
 }

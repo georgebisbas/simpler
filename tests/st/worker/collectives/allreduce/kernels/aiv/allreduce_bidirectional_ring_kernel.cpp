@@ -28,6 +28,12 @@
  *   [0 .. P*subchunk)              ring0 chunks (clockwise ring)
  *   [P*subchunk .. 2*P*subchunk)   ring1 chunks (counter-clockwise ring)
  *   tail                           (2*(P−1)+1)*kMaxSupportedRanks int32 barrier rows
+ *
+ * The element count is a runtime scalar (args[6]): each subchunk
+ * (count/(2*nranks) elements) is processed in fixed kChunkCols-wide tiles,
+ * with the loop trip count set by the runtime values instead of being fully
+ * unrolled at compile time. Barrier round counts are unaffected — they
+ * depend only on nranks.
  */
 
 #include <cstdint>
@@ -46,8 +52,9 @@
 #define __aicore__ [aicore]
 #endif
 
-static constexpr size_t ALLREDUCE_COUNT = 256;
 static constexpr int kMaxSupportedRanks = 16;
+// UB tile slot size: TASSIGN spacing is 0x10000 bytes -> 16384 float32 columns per tile.
+static constexpr int kChunkCols = 16384;
 
 template <typename T>
 AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPtr, int pe) {
@@ -95,6 +102,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int nranks = static_cast<int>(args[3]);
     __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[4]);
     CollectiveReduceOp reduce_op = static_cast<CollectiveReduceOp>(args[5]);
+    int count = static_cast<int>(args[6]);
     // TPUT<AtomicAdd> only supports Sum reduction.
     if (reduce_op != CollectiveReduceOp::kSum) {
         pipe_barrier(PIPE_ALL);
@@ -112,12 +120,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int my_rank = static_cast<int>(commCtx->rankId);
 
-    if (nranks <= 1 || nranks > kMaxSupportedRanks || (ALLREDUCE_COUNT % (2ULL * static_cast<size_t>(nranks))) != 0) {
+    if (nranks <= 1 || nranks > kMaxSupportedRanks || count <= 0 || (count % (2 * nranks)) != 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
 
-    const int subchunk_elems = static_cast<int>(ALLREDUCE_COUNT / (2 * static_cast<size_t>(nranks)));
+    const int subchunk_elems = count / (2 * nranks);
     const int chunk_elems = 2 * subchunk_elems;
     const int ring_stride = nranks * subchunk_elems;
 
@@ -125,26 +133,28 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *ring1 = scratch + ring_stride;  // counter-clockwise ring — second half
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(scratch + static_cast<size_t>(2 * ring_stride));
 
-    using TileSub = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
-    TileSub pushTile(1, subchunk_elems);
+    using TileSub = pto::Tile<pto::TileType::Vec, float, 1, kChunkCols, pto::BLayout::RowMajor, -1, -1>;
+    TileSub pushTile(1, kChunkCols);
     TASSIGN(pushTile, 0x10000);
 
-    using TileSubStage = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
-    TileSubStage stageTile(1, subchunk_elems);
+    using TileSubStage = pto::Tile<pto::TileType::Vec, float, 1, kChunkCols, pto::BLayout::RowMajor, -1, -1>;
+    TileSubStage stageTile(1, kChunkCols);
     TASSIGN(stageTile, 0x0);
 
-    ShapeDyn subShape(1, 1, 1, 1, subchunk_elems);
     StrideDyn subStride(subchunk_elems, subchunk_elems, subchunk_elems, subchunk_elems, 1);
 
     // ------------------------------------------------------------------
     // Phase 1: stage-in — split each logical chunk into ring0 (first half)
-    //           and ring1 (second half).
+    //           and ring1 (second half), kChunkCols elements at a time.
     // ------------------------------------------------------------------
     for (int c = 0; c < nranks; ++c) {
         // ring0 ← first half of chunk c.
-        {
-            __gm__ float *dst = ring0 + static_cast<size_t>(c * subchunk_elems);
-            __gm__ float *src = input + static_cast<size_t>(c * chunk_elems);
+        for (int off = 0; off < subchunk_elems; off += kChunkCols) {
+            int sc = (subchunk_elems - off < kChunkCols) ? (subchunk_elems - off) : kChunkCols;
+            stageTile.ColMaskInternal = sc;
+            ShapeDyn subShape(1, 1, 1, 1, sc);
+            __gm__ float *dst = ring0 + static_cast<size_t>(c * subchunk_elems + off);
+            __gm__ float *src = input + static_cast<size_t>(c * chunk_elems + off);
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             TLOAD(stageTile, srcG);
@@ -155,9 +165,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
         // ring1 ← second half of chunk c.
-        {
-            __gm__ float *dst = ring1 + static_cast<size_t>(c * subchunk_elems);
-            __gm__ float *src = input + static_cast<size_t>(c * chunk_elems + subchunk_elems);
+        for (int off = 0; off < subchunk_elems; off += kChunkCols) {
+            int sc = (subchunk_elems - off < kChunkCols) ? (subchunk_elems - off) : kChunkCols;
+            stageTile.ColMaskInternal = sc;
+            ShapeDyn subShape(1, 1, 1, 1, sc);
+            __gm__ float *dst = ring1 + static_cast<size_t>(c * subchunk_elems + off);
+            __gm__ float *src = input + static_cast<size_t>(c * chunk_elems + subchunk_elems + off);
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             TLOAD(stageTile, srcG);
@@ -184,24 +197,30 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     for (int step = 1; step < nranks; ++step) {
         NeighborBarrier(commCtx, signal_base + (step - 1) * kMaxSupportedRanks, my_rank, left, right);
 
-        // Ring0: push ring0[(r - step + P) % P] → right's ring0[same index].
-        {
-            const int idx = (my_rank - step + nranks) % nranks;
-            __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems);
-            __gm__ float *dst = CommRemotePtr(commCtx, src, right);
-            GT srcG(src, subShape, subStride);
-            GT dstG(dst, subShape, subStride);
-            pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-        }
+        for (int off = 0; off < subchunk_elems; off += kChunkCols) {
+            int sc = (subchunk_elems - off < kChunkCols) ? (subchunk_elems - off) : kChunkCols;
+            pushTile.ColMaskInternal = sc;
+            ShapeDyn subShape(1, 1, 1, 1, sc);
 
-        // Ring1: push ring1[(r + step + P) % P] → left's ring1[same index].
-        {
-            const int idx = (my_rank + step + nranks) % nranks;
-            __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems);
-            __gm__ float *dst = CommRemotePtr(commCtx, src, left);
-            GT srcG(src, subShape, subStride);
-            GT dstG(dst, subShape, subStride);
-            pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+            // Ring0: push ring0[(r - step + P) % P] → right's ring0[same index].
+            {
+                const int idx = (my_rank - step + nranks) % nranks;
+                __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems + off);
+                __gm__ float *dst = CommRemotePtr(commCtx, src, right);
+                GT srcG(src, subShape, subStride);
+                GT dstG(dst, subShape, subStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+            }
+
+            // Ring1: push ring1[(r + step + P) % P] → left's ring1[same index].
+            {
+                const int idx = (my_rank + step + nranks) % nranks;
+                __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems + off);
+                __gm__ float *dst = CommRemotePtr(commCtx, src, left);
+                GT srcG(src, subShape, subStride);
+                GT dstG(dst, subShape, subStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+            }
         }
 
         pipe_barrier(PIPE_ALL);
@@ -217,25 +236,31 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         const int rs_rounds = nranks - 1;
         NeighborBarrier(commCtx, signal_base + (rs_rounds + step - 1) * kMaxSupportedRanks, my_rank, left, right);
 
-        // Ring0 AG.
-        {
-            const int idx = (my_rank - step + 1 + nranks) % nranks;
-            __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems);
-            __gm__ float *dst = CommRemotePtr(commCtx, src, right);
-            GT srcG(src, subShape, subStride);
-            GT dstG(dst, subShape, subStride);
-            pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
-        }
+        for (int off = 0; off < subchunk_elems; off += kChunkCols) {
+            int sc = (subchunk_elems - off < kChunkCols) ? (subchunk_elems - off) : kChunkCols;
+            pushTile.ColMaskInternal = sc;
+            ShapeDyn subShape(1, 1, 1, 1, sc);
 
-        // Ring1 AG: send_idx = (r + step - 1 + P) % P
-        // The chunk was received from rank r+1 in the previous AG step.
-        {
-            const int idx = (my_rank + step - 1 + nranks) % nranks;
-            __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems);
-            __gm__ float *dst = CommRemotePtr(commCtx, src, left);
-            GT srcG(src, subShape, subStride);
-            GT dstG(dst, subShape, subStride);
-            pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+            // Ring0 AG.
+            {
+                const int idx = (my_rank - step + 1 + nranks) % nranks;
+                __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems + off);
+                __gm__ float *dst = CommRemotePtr(commCtx, src, right);
+                GT srcG(src, subShape, subStride);
+                GT dstG(dst, subShape, subStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+            }
+
+            // Ring1 AG: send_idx = (r + step - 1 + P) % P
+            // The chunk was received from rank r+1 in the previous AG step.
+            {
+                const int idx = (my_rank + step - 1 + nranks) % nranks;
+                __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems + off);
+                __gm__ float *dst = CommRemotePtr(commCtx, src, left);
+                GT srcG(src, subShape, subStride);
+                GT dstG(dst, subShape, subStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+            }
         }
 
         pipe_barrier(PIPE_ALL);
@@ -253,9 +278,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     for (int c = 0; c < nranks; ++c) {
         // First half of chunk c ← ring0.
-        {
-            __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems);
-            __gm__ float *src = ring0 + static_cast<size_t>(c * subchunk_elems);
+        for (int off = 0; off < subchunk_elems; off += kChunkCols) {
+            int sc = (subchunk_elems - off < kChunkCols) ? (subchunk_elems - off) : kChunkCols;
+            stageTile.ColMaskInternal = sc;
+            ShapeDyn subShape(1, 1, 1, 1, sc);
+            __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems + off);
+            __gm__ float *src = ring0 + static_cast<size_t>(c * subchunk_elems + off);
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             TLOAD(stageTile, srcG);
@@ -266,9 +294,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
         // Second half of chunk c ← ring1.
-        {
-            __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems + subchunk_elems);
-            __gm__ float *src = ring1 + static_cast<size_t>(c * subchunk_elems);
+        for (int off = 0; off < subchunk_elems; off += kChunkCols) {
+            int sc = (subchunk_elems - off < kChunkCols) ? (subchunk_elems - off) : kChunkCols;
+            stageTile.ColMaskInternal = sc;
+            ShapeDyn subShape(1, 1, 1, 1, sc);
+            __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems + subchunk_elems + off);
+            __gm__ float *src = ring1 + static_cast<size_t>(c * subchunk_elems + off);
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             TLOAD(stageTile, srcG);

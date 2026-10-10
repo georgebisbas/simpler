@@ -12,13 +12,15 @@
  * Ring AllReduce orchestration — chunked RS+AG kernel shim.
  *
  * Three simpler::tmr::Tensor args (the kernel reads ``simpler::tmr::Tensor->buffer.addr`` + start_offset
- * to get the real device pointer) plus two scalars:
+ * to get the real device pointer) plus four scalars:
  *
  *   tensor(0) input   INPUT           (plain device mem, staged in by bootstrap)
  *   tensor(1) output  OUTPUT_EXISTING (plain device mem, flushed by bootstrap)
  *   tensor(2) scratch INOUT           (HCCL window; chunked RS+AG in AIV kernel)
  *   scalar(0) nranks
  *   scalar(1) CommContext device pointer
+ *   scalar(2) reduce_op
+ *   scalar(3) count (runtime element count)
  *
  * INOUT on scratch expresses that the kernel both writes (stage-in, ring
  * publish) and reads (reduce-scatter / allgather remote TLOAD) it.
@@ -34,7 +36,7 @@ __attribute__((visibility("default"))) OrchestrationConfig
 allreduce_ring_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 6,  // 3 tensors + 3 scalars
+        .expected_arg_count = 7,  // 3 tensors + 4 scalars
     };
 }
 
@@ -50,6 +52,7 @@ __attribute__((visibility("default"))) void allreduce_ring_orchestration(const C
     params.add_scalar(orch_args.scalar(0));  // nranks
     params.add_scalar(orch_args.scalar(1));  // CommContext
     params.add_scalar(orch_args.scalar(2));  // reduce_op
+    params.add_scalar(orch_args.scalar(3));  // count
     rt_submit_aiv_task(0, params);
 }
 

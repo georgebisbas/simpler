@@ -11,13 +11,15 @@
 /**
  * IBing AllReduce orchestration — kernel shim.
  *
- * Three simpler::tmr::Tensor args plus two scalars:
+ * Three simpler::tmr::Tensor args plus four scalars:
  *
  *   tensor(0) input   INPUT           (plain device mem, staged in by bootstrap)
  *   tensor(1) output  OUTPUT_EXISTING (plain device mem, flushed by bootstrap)
  *   tensor(2) scratch INOUT           (HCCL window; IBing interleaved RS+AG in AIV kernel)
  *   scalar(0) nranks
  *   scalar(1) CommContext device pointer
+ *   scalar(2) reduce_op
+ *   scalar(3) count (runtime element count)
  *
  * INOUT on scratch expresses that the kernel both writes (stage-in, push
  * to neighbours) and is updated by neighbours (remote atomic pushes
@@ -34,7 +36,7 @@ __attribute__((visibility("default"))) OrchestrationConfig
 allreduce_ibing_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 6,  // 3 tensors + 3 scalars
+        .expected_arg_count = 7,  // 3 tensors + 4 scalars
     };
 }
 
@@ -62,6 +64,7 @@ __attribute__((visibility("default"))) void allreduce_ibing_orchestration(const 
     params.add_scalar(orch_args.scalar(0));  // nranks
     params.add_scalar(orch_args.scalar(1));  // CommContext
     params.add_scalar(orch_args.scalar(2));  // reduce_op
+    params.add_scalar(orch_args.scalar(3));  // count
     rt_submit_aiv_task(0, params);
 }
 

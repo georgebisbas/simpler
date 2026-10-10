@@ -635,5 +635,295 @@ class TestAllreduceIbingRejectNonSum(SceneTestCase):
             super().test_run(st_platform, st_worker, request)
 
 
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceTwophaseP2CountSweep(SceneTestCase):
+    """Allreduce twophase — 2-rank, runtime element count sweep."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "twophase_count_16384_chunk_boundary",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 1, "reduce_op": 0, "count": 16384},
+        },
+        {
+            "name": "twophase_count_20000_non_multiple",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 1, "reduce_op": 0, "count": 20000},
+        },
+        {
+            "name": "twophase_count_65536",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 1, "reduce_op": 0, "count": 65536},
+        },
+        {
+            "name": "twophase_count_65536_max",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 1, "reduce_op": 1, "count": 65536},
+        },
+        {
+            "name": "twophase_count_65536_min",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 1, "reduce_op": 2, "count": 65536},
+        },
+        {
+            "name": "twophase_count_65536_prod",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 1, "reduce_op": 3, "count": 65536},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"], params["count"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"]), params["count"]),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceTwophaseP4CountSweep(SceneTestCase):
+    """Allreduce twophase — 4-rank, runtime element count sweep."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "twophase_count_65536",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": True,
+            "config": {"device_count": 4},
+            "params": {"nranks": 4, "mode_id": 1, "reduce_op": 0, "count": 65536},
+        },
+        {
+            "name": "twophase_count_20000_non_multiple",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": True,
+            "config": {"device_count": 4},
+            "params": {"nranks": 4, "mode_id": 1, "reduce_op": 0, "count": 20000},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"], params["count"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"]), params["count"]),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceRingP2CountSweep(SceneTestCase):
+    """Allreduce ring — 2-rank, runtime element count sweep."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "ring_count_16384_chunk_boundary",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 0, "count": 16384},
+        },
+        {
+            "name": "ring_count_20000_non_multiple",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 0, "count": 20000},
+        },
+        {
+            "name": "ring_count_65536",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 0, "count": 65536},
+        },
+        {
+            "name": "ring_count_65536_max",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 1, "count": 65536},
+        },
+        {
+            "name": "ring_count_65536_min",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 2, "count": 65536},
+        },
+        {
+            "name": "ring_count_65536_prod",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 2, "reduce_op": 3, "count": 65536},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"], params["count"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"]), params["count"]),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceRingP4CountSweep(SceneTestCase):
+    """Allreduce ring — 4-rank, runtime element count sweep."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "ring_count_65536",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": True,
+            "config": {"device_count": 4},
+            "params": {"nranks": 4, "mode_id": 2, "reduce_op": 0, "count": 65536},
+        },
+        {
+            "name": "ring_count_20000_non_multiple",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": True,
+            "config": {"device_count": 4},
+            "params": {"nranks": 4, "mode_id": 2, "reduce_op": 0, "count": 20000},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"], params["count"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"]), params["count"]),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceBidirectionalRingP2CountSweep(SceneTestCase):
+    """Allreduce bidirectional_ring — 2-rank, runtime element count sweep (Sum only)."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "bidirectional_ring_count_16384_chunk_boundary",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 3, "reduce_op": 0, "count": 16384},
+        },
+        {
+            "name": "bidirectional_ring_count_20000_non_multiple",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 3, "reduce_op": 0, "count": 20000},
+        },
+        {
+            "name": "bidirectional_ring_count_65536",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 3, "reduce_op": 0, "count": 65536},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"], params["count"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"]), params["count"]),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceBidirectionalRingP4CountSweep(SceneTestCase):
+    """Allreduce bidirectional_ring — 4-rank, runtime element count sweep (Sum only)."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "bidirectional_ring_count_65536",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": True,
+            "config": {"device_count": 4},
+            "params": {"nranks": 4, "mode_id": 3, "reduce_op": 0, "count": 65536},
+        },
+        {
+            "name": "bidirectional_ring_count_20000_non_multiple",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": True,
+            "config": {"device_count": 4},
+            "params": {"nranks": 4, "mode_id": 3, "reduce_op": 0, "count": 20000},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"], params["count"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"]), params["count"]),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestAllreduceIbingP2CountSweep(SceneTestCase):
+    """Allreduce ibing — 2-rank (P=2 only), runtime element count sweep (Sum only)."""
+
+    CALLABLE = {"orchestration": allreduce_orch_fn, "callables": _ALLREDUCE_MODES}
+    CASES = [
+        {
+            "name": "ibing_count_16384_chunk_boundary",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 4, "reduce_op": 0, "count": 16384},
+        },
+        {
+            "name": "ibing_count_20000_non_multiple",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 4, "reduce_op": 0, "count": 20000},
+        },
+        {
+            "name": "ibing_count_65536",
+            "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2, "mode_id": 4, "reduce_op": 0, "count": 65536},
+        },
+    ]
+
+    def generate_args(self, params):
+        return make_allreduce_args(params["nranks"], params["mode_id"], params["reduce_op"], params["count"])
+
+    def compute_golden(self, args, params):
+        expected = torch.tensor(
+            allreduce_expected_output(params["nranks"], CollectiveReduceOp(params["reduce_op"]), params["count"]),
+            dtype=torch.float32,
+        )
+        for rank in range(params["nranks"]):
+            getattr(args, f"out_{rank}").copy_(expected)
+
+
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)

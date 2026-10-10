@@ -12,13 +12,18 @@ Five algorithm variants, each with its own `@scene_test(level=3)` class.
 | `bidirectional_ring` | Two-ring bidirectional push RS+AG on disjoint data halves | O(2×(P-1)/P×N) | 2×(P-1)+1 mesh | Large P, double throughput |
 | `ibing` | IBing interleaved RS+AG (Zong et al., ACM TACO 2025) | O((P+2)×N/P) | 2×(P-1)+1 mesh | P=2 only, shared-memory push-model |
 
+All five kernels take the element count as a runtime scalar rather than a
+fixed compile-time constant: each per-rank chunk (or the full vector, for
+`onephase`) is processed in `kChunkCols` (16384)-wide tiles, with the loop
+trip count set by the runtime value. Barrier/round counts are unaffected by
+`count` — they depend only on `nranks`. `twophase`, `ring`, and `ibing`
+require `count % nranks == 0`; `bidirectional_ring` requires
+`count % (2*nranks) == 0` — same divisibility rule as before, just evaluated
+against the runtime `count` instead of the fixed `ALLREDUCE_COUNT`.
+
 ### One-Phase Mesh (Direct)
 
 Each rank reads the full vector from every peer and accumulates locally.
-Unlike the other four modes, `onephase`'s element count is a runtime scalar
-rather than the fixed `ALLREDUCE_COUNT=256` — large payloads are processed
-in `kChunkCols` (16384)-wide chunks, so `onephase` is the mode to use when a
-test or caller needs a count other than 256.
 
 ### Two-Phase Mesh (RS+AG)
 
@@ -52,9 +57,9 @@ AIV kernel's `TPUT<AtomicAdd>` has no Max/Min variant).
 `allreduce_expected_output` in `_helpers.py` for the Max/Min/Prod goldens.
 
 Each rank's input: `[i + rank*100 for i in range(C)]`, where `C` is
-`ALLREDUCE_COUNT=256` for every mode except `onephase`, whose `CASES` may set
-a `count` param to any value (`allreduce_expected_output` and
-`make_allreduce_args` both take an optional `count` override for this).
+`ALLREDUCE_COUNT=256` by default, or any value a `CASES` entry sets via a
+`count` param (`allreduce_expected_output` and `make_allreduce_args` both
+take an optional `count` override for this).
 
 ## Test Classes
 
@@ -74,9 +79,16 @@ a `count` param to any value (`allreduce_expected_output` and
 | `TestAllreduceOnephaseP2CountSweep` | 2 | onephase | Sum, Max, Min, Prod (runtime `count` sweep: 256 / 16384 chunk-boundary / 20000 non-multiple / 65536 / 262144) |
 | `TestAllreduceOnephaseP4CountSweep` | 4 | onephase | Sum (runtime `count`: 65536, 20000 non-multiple) |
 | `TestAllreduceTwophaseP2MaxMinProd` | 2 | twophase | Max, Min, Prod |
+| `TestAllreduceTwophaseP2CountSweep` | 2 | twophase | Sum, Max, Min, Prod (runtime `count`: 16384 chunk-boundary / 20000 non-multiple / 65536) |
+| `TestAllreduceTwophaseP4CountSweep` | 4 | twophase | Sum (runtime `count`: 65536, 20000 non-multiple) |
 | `TestAllreduceRingP2MaxMinProd` | 2 | ring | Max, Min, Prod |
+| `TestAllreduceRingP2CountSweep` | 2 | ring | Sum, Max, Min, Prod (runtime `count`: 16384 chunk-boundary / 20000 non-multiple / 65536) |
+| `TestAllreduceRingP4CountSweep` | 4 | ring | Sum (runtime `count`: 65536, 20000 non-multiple) |
 | `TestAllreduceBidirectionalRingRejectNonSum` | 2 | bidirectional_ring (negative: expects `RuntimeError`) | Max |
+| `TestAllreduceBidirectionalRingP2CountSweep` | 2 | bidirectional_ring | Sum (runtime `count`: 16384 chunk-boundary / 20000 non-multiple / 65536) |
+| `TestAllreduceBidirectionalRingP4CountSweep` | 4 | bidirectional_ring | Sum (runtime `count`: 65536, 20000 non-multiple) |
 | `TestAllreduceIbingRejectNonSum` | 2 | ibing (negative: expects `RuntimeError`) | Max |
+| `TestAllreduceIbingP2CountSweep` | 2 | ibing | Sum (runtime `count`: 16384 chunk-boundary / 20000 non-multiple / 65536) |
 
 ## Run
 

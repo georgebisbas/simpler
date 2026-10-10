@@ -28,6 +28,12 @@
  *   scalar(0) = nranks
  *   scalar(1) = CommContext device pointer
  *   scalar(2) = reduce_op (CollectiveReduceOp: 0=Sum, 1=Max, 2=Min, 3=Prod)
+ *   scalar(3) = count (runtime element count)
+ *
+ * The element count is a runtime scalar: each per-rank chunk (count/nranks
+ * elements) and the Phase 1 full-vector stage-in are processed in fixed
+ * kChunkCols-wide tiles, with the loop trip count set by the runtime values
+ * instead of being fully unrolled at compile time.
  */
 
 #include <cstdint>
@@ -46,8 +52,9 @@
 #define __aicore__ [aicore]
 #endif
 
-static constexpr size_t ALLREDUCE_COUNT = 256;
 static constexpr int kMaxSupportedRanks = 16;
+// UB tile slot size: TASSIGN spacing is 0x10000 bytes -> 16384 float32 columns per tile.
+static constexpr int kChunkCols = 16384;
 
 template <typename T>
 AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPtr, int pe) {
@@ -78,6 +85,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int nranks = static_cast<int>(args[3]);
     __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[4]);
     CollectiveReduceOp reduce_op = static_cast<CollectiveReduceOp>(args[5]);
+    int count = static_cast<int>(args[6]);
 
     __gm__ float *input = reinterpret_cast<__gm__ float *>(input_tensor->buffer.addr) + input_tensor->start_offset;
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
@@ -86,12 +94,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int my_rank = static_cast<int>(commCtx->rankId);
 
-    if (nranks <= 1 || nranks > kMaxSupportedRanks || (ALLREDUCE_COUNT % static_cast<size_t>(nranks)) != 0) {
+    if (nranks <= 1 || nranks > kMaxSupportedRanks || count <= 0 || (count % nranks) != 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
 
-    const int chunk_elems = static_cast<int>(ALLREDUCE_COUNT / static_cast<size_t>(nranks));
+    const int chunk_elems = count / nranks;
 
     // Signal rows: 2 rows (RS barrier + AG barrier), each with kMaxSupportedRanks slots.
     // Located after the nranks * chunk_elems float staging area.
@@ -101,34 +109,35 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using ShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
     using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
     using Global = pto::GlobalTensor<float, ShapeDyn, StrideDyn, pto::Layout::ND>;
-    using TileData = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
+    using TileData = pto::Tile<pto::TileType::Vec, float, 1, kChunkCols, pto::BLayout::RowMajor, -1, -1>;
 
-    TileData chunkTile(1, chunk_elems);
-    TileData accTile(1, chunk_elems);
-    TileData recvTile(1, chunk_elems);
-    TileData stageTile(1, ALLREDUCE_COUNT);
+    TileData chunkTile(1, kChunkCols);
+    TileData accTile(1, kChunkCols);
+    TileData recvTile(1, kChunkCols);
     TASSIGN(chunkTile, 0x0);
     TASSIGN(accTile, 0x10000);
     TASSIGN(recvTile, 0x20000);
-    TASSIGN(stageTile, 0x0);
 
-    ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
     StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
-    ShapeDyn fullShape(1, 1, 1, 1, ALLREDUCE_COUNT);
-    StrideDyn fullStride(ALLREDUCE_COUNT, ALLREDUCE_COUNT, ALLREDUCE_COUNT, ALLREDUCE_COUNT, 1);
+    StrideDyn fullStride(count, count, count, count, 1);
 
     // ------------------------------------------------------------------
     // Phase 1: stage-in — copy local input into P contiguous chunk slots
     // in the HCCL window so all peers can read any chunk in Phase 3/5.
     // ------------------------------------------------------------------
-    Global inputG(input, fullShape, fullStride);
-    Global scratchG(scratch, fullShape, fullStride);
-    TLOAD(stageTile, inputG);
-    set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-    TSTORE(scratchG, stageTile);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    for (int off = 0; off < count; off += kChunkCols) {
+        int c = (count - off < kChunkCols) ? (count - off) : kChunkCols;
+        chunkTile.ColMaskInternal = c;
+        ShapeDyn shape(1, 1, 1, 1, c);
+        Global inputG(input + off, shape, fullStride);
+        Global scratchG(scratch + off, shape, fullStride);
+        TLOAD(chunkTile, inputG);
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        TSTORE(scratchG, chunkTile);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    }
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
@@ -138,45 +147,51 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     // ------------------------------------------------------------------
     // Phase 3: reduce-scatter — each rank reduces chunk[my_rank] from
-    // all peers into its local scratch[my_rank]. After this phase,
-    // rank r owns the fully reduced chunk r.
+    // all peers into its local scratch[my_rank], kChunkCols elements at
+    // a time. After this phase, rank r owns the fully reduced chunk r.
     // ------------------------------------------------------------------
-    Global myChunkG(scratch + my_rank * chunk_elems, chunkShape, chunkStride);
-    TLOAD(accTile, myChunkG);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    for (int off = 0; off < chunk_elems; off += kChunkCols) {
+        int c = (chunk_elems - off < kChunkCols) ? (chunk_elems - off) : kChunkCols;
+        accTile.ColMaskInternal = c;
+        recvTile.ColMaskInternal = c;
+        ShapeDyn shape(1, 1, 1, 1, c);
+        Global myChunkG(scratch + my_rank * chunk_elems + off, shape, chunkStride);
+        TLOAD(accTile, myChunkG);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-    for (int peer = 0; peer < nranks; ++peer) {
-        if (peer == my_rank) continue;
-        __gm__ float *remote_chunk = CommRemotePtr(commCtx, scratch + my_rank * chunk_elems, peer);
-        Global remoteG(remote_chunk, chunkShape, chunkStride);
-        TLOAD(recvTile, remoteG);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-        switch (reduce_op) {
-        case CollectiveReduceOp::kSum:
-            TADD(accTile, accTile, recvTile);
-            break;
-        case CollectiveReduceOp::kMax:
-            TMAX(accTile, accTile, recvTile);
-            break;
-        case CollectiveReduceOp::kMin:
-            TMIN(accTile, accTile, recvTile);
-            break;
-        case CollectiveReduceOp::kProd:
-            TMUL(accTile, accTile, recvTile);
-            break;
+        for (int peer = 0; peer < nranks; ++peer) {
+            if (peer == my_rank) continue;
+            __gm__ float *remote_chunk = CommRemotePtr(commCtx, scratch + my_rank * chunk_elems + off, peer);
+            Global remoteG(remote_chunk, shape, chunkStride);
+            TLOAD(recvTile, remoteG);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+            switch (reduce_op) {
+            case CollectiveReduceOp::kSum:
+                TADD(accTile, accTile, recvTile);
+                break;
+            case CollectiveReduceOp::kMax:
+                TMAX(accTile, accTile, recvTile);
+                break;
+            case CollectiveReduceOp::kMin:
+                TMIN(accTile, accTile, recvTile);
+                break;
+            case CollectiveReduceOp::kProd:
+                TMUL(accTile, accTile, recvTile);
+                break;
+            }
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
         }
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    }
 
-    // Write reduced chunk back to scratch for allgather phase.
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(myChunkG, accTile);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        // Write reduced chunk back to scratch for allgather phase.
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        TSTORE(myChunkG, accTile);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    }
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
@@ -187,21 +202,27 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     MeshBarrier(commCtx, signal_ag, my_rank, nranks);
 
     // ------------------------------------------------------------------
-    // Phase 5: allgather — each rank reads every peer's reduced chunk
-    // and writes it to the corresponding output slice. Rank r reads
-    // peer[p].scratch[p] and writes to output[p * chunk_elems].
+    // Phase 5: allgather — each rank reads every peer's reduced chunk,
+    // kChunkCols elements at a time, and writes it to the corresponding
+    // output slice. Rank r reads peer[p].scratch[p] and writes to
+    // output[p * chunk_elems].
     // ------------------------------------------------------------------
     for (int r = 0; r < nranks; ++r) {
-        // Read chunk r from rank r (the owner of the reduced chunk r).
-        __gm__ float *remote_chunk = CommRemotePtr(commCtx, scratch + r * chunk_elems, r);
-        Global remoteG(remote_chunk, chunkShape, chunkStride);
-        Global outputSlotG(output + r * chunk_elems, chunkShape, chunkStride);
-        TLOAD(recvTile, remoteG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(outputSlotG, recvTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        for (int off = 0; off < chunk_elems; off += kChunkCols) {
+            int c = (chunk_elems - off < kChunkCols) ? (chunk_elems - off) : kChunkCols;
+            recvTile.ColMaskInternal = c;
+            ShapeDyn shape(1, 1, 1, 1, c);
+            // Read chunk r from rank r (the owner of the reduced chunk r).
+            __gm__ float *remote_chunk = CommRemotePtr(commCtx, scratch + r * chunk_elems + off, r);
+            Global remoteG(remote_chunk, shape, chunkStride);
+            Global outputSlotG(output + r * chunk_elems + off, shape, chunkStride);
+            TLOAD(recvTile, remoteG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            TSTORE(outputSlotG, recvTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        }
     }
     pipe_barrier(PIPE_ALL);
 }
