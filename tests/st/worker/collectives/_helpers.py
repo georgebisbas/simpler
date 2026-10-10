@@ -61,10 +61,15 @@ SIGNAL_TAIL_NBYTES = MAX_RANKS * DTYPE_NBYTES  # one int32 slot per potential ra
 _ALLREDUCE_MODE_NAMES = ["onephase", "twophase", "ring", "bidirectional_ring", "ibing"]
 
 
-def _allreduce_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
-    """Compute (float_elems, scratch_nbytes, window_size) for an allreduce mode."""
+def _allreduce_scratch_params(mode: str, nranks: int, count: int | None = None) -> tuple[int, int, int]:
+    """Compute (float_elems, scratch_nbytes, window_size) for an allreduce mode.
+
+    ``count`` overrides ``ALLREDUCE_COUNT`` for ``onephase``, whose kernel takes
+    the element count as a runtime scalar; every other mode still runs at the
+    fixed ``ALLREDUCE_COUNT``.
+    """
     if mode == "onephase":
-        float_elems = ALLREDUCE_COUNT
+        float_elems = ALLREDUCE_COUNT if count is None else count
         scratch_nbytes = float_elems * ALLREDUCE_DTYPE_NBYTES + ALLREDUCE_MAX_RANKS * ALLREDUCE_DTYPE_NBYTES
     elif mode == "twophase":
         chunk_elems = ALLREDUCE_COUNT // nranks
@@ -135,7 +140,8 @@ def allreduce_orch_fn(orch, callables, task_args, config):
         )
 
     chip = getattr(callables, f"allreduce_{mode}")
-    float_elems, scratch_nbytes, window_size = _allreduce_scratch_params(mode, nranks)
+    count_val = int(task_args.count.value) if hasattr(task_args, "count") else None
+    float_elems, scratch_nbytes, window_size = _allreduce_scratch_params(mode, nranks, count_val)
 
     with orch.allocate_domain(
         name="default",
@@ -155,6 +161,8 @@ def allreduce_orch_fn(orch, callables, task_args, config):
             chip_args.add_scalar(domain.domain_size)
             chip_args.add_scalar(domain.device_ctx)
             chip_args.add_scalar(reduce_op_val)
+            if mode == "onephase":
+                chip_args.add_scalar(count_val if count_val is not None else ALLREDUCE_COUNT)
             args_list.append(chip_args)
         orch.submit_next_level_group(chip, args_list, config, workers=list(range(nranks)))
 
@@ -164,19 +172,22 @@ def allreduce_orch_fn(orch, callables, task_args, config):
 # ---------------------------------------------------------------------------
 
 
-def allreduce_expected_output(nranks: int, reduce_op: CollectiveReduceOp = CollectiveReduceOp.SUM) -> list[float]:
+def allreduce_expected_output(
+    nranks: int, reduce_op: CollectiveReduceOp = CollectiveReduceOp.SUM, count: int | None = None
+) -> list[float]:
     """output = reduce_op over all rank inputs.
 
     Input[rank][i] = i + rank*100.  Return [golden[i] for i in range(C)].
     """
+    c = ALLREDUCE_COUNT if count is None else count
     if reduce_op == CollectiveReduceOp.SUM:
-        return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(ALLREDUCE_COUNT)]
+        return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(c)]
     if reduce_op == CollectiveReduceOp.MAX:
-        return [float((nranks - 1) * 100 + i) for i in range(ALLREDUCE_COUNT)]
+        return [float((nranks - 1) * 100 + i) for i in range(c)]
     if reduce_op == CollectiveReduceOp.MIN:
-        return [float(i) for i in range(ALLREDUCE_COUNT)]
+        return [float(i) for i in range(c)]
     if reduce_op == CollectiveReduceOp.PROD:
-        return [allreduce_prod_expected(nranks, i) for i in range(ALLREDUCE_COUNT)]
+        return [allreduce_prod_expected(nranks, i) for i in range(c)]
     raise ValueError(f"unsupported reduce_op: {reduce_op}")
 
 
@@ -293,23 +304,28 @@ def all_to_all_expected_output(nranks: int, rank: int) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
-def make_allreduce_args(nranks: int, mode_id: int, reduce_op: int = 0) -> TaskArgsBuilder:
+def make_allreduce_args(nranks: int, mode_id: int, reduce_op: int = 0, count: int | None = None) -> TaskArgsBuilder:
     """Build per-rank input/output tensors + nranks/mode_id/reduce_op scalars.
 
-    input[rank][i] = i + rank*100. Output initially zeros.
+    input[rank][i] = i + rank*100. Output initially zeros. ``count`` overrides
+    the fixed ``ALLREDUCE_COUNT`` element count and, when given, is also
+    carried as a ``count`` scalar for modes (``mesh_dynamic``) that read it.
     """
     from simpler_setup import Scalar as SScalar  # noqa: PLC0415
 
+    elems = ALLREDUCE_COUNT if count is None else count
     builder_specs = []
     for rank in range(nranks):
         inp = torch.tensor(
-            [i + rank * 100 for i in range(ALLREDUCE_COUNT)],
+            [i + rank * 100 for i in range(elems)],
             dtype=torch.float32,
         ).share_memory_()
-        out = torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_()
+        out = torch.zeros(elems, dtype=torch.float32).share_memory_()
         builder_specs.append(STensor(f"in_{rank}", inp))
         builder_specs.append(STensor(f"out_{rank}", out))
     builder_specs.append(SScalar("nranks", ctypes.c_int64(nranks)))
     builder_specs.append(SScalar("mode_id", ctypes.c_int64(mode_id)))
     builder_specs.append(SScalar("reduce_op", ctypes.c_int64(reduce_op)))
+    if count is not None:
+        builder_specs.append(SScalar("count", ctypes.c_int64(count)))
     return TaskArgsBuilder(*builder_specs)

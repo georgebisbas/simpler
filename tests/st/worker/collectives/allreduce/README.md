@@ -15,6 +15,10 @@ Five algorithm variants, each with its own `@scene_test(level=3)` class.
 ### One-Phase Mesh (Direct)
 
 Each rank reads the full vector from every peer and accumulates locally.
+Unlike the other four modes, `onephase`'s element count is a runtime scalar
+rather than the fixed `ALLREDUCE_COUNT=256` — large payloads are processed
+in `kChunkCols` (16384)-wide chunks, so `onephase` is the mode to use when a
+test or caller needs a count other than 256.
 
 ### Two-Phase Mesh (RS+AG)
 
@@ -47,7 +51,10 @@ AIV kernel's `TPUT<AtomicAdd>` has no Max/Min variant).
 `output[i] = nranks*i + 100*nranks*(nranks-1)//2` for Sum; see
 `allreduce_expected_output` in `_helpers.py` for the Max/Min/Prod goldens.
 
-Each rank's input: `[i + rank*100 for i in range(256)]`.
+Each rank's input: `[i + rank*100 for i in range(C)]`, where `C` is
+`ALLREDUCE_COUNT=256` for every mode except `onephase`, whose `CASES` may set
+a `count` param to any value (`allreduce_expected_output` and
+`make_allreduce_args` both take an optional `count` override for this).
 
 ## Test Classes
 
@@ -64,6 +71,8 @@ Each rank's input: `[i + rank*100 for i in range(256)]`.
 | `TestAllreduceBidirectionalRingP4` | 4 | bidirectional_ring | Sum |
 | `TestAllreduceIbingNranksError` | 4 | ibing (negative: expects `ValueError`) | Sum |
 | `TestAllreduceOnephaseP2MaxMinProd` | 2 | onephase | Max, Min, Prod |
+| `TestAllreduceOnephaseP2CountSweep` | 2 | onephase | Sum, Max, Min, Prod (runtime `count` sweep: 256 / 16384 chunk-boundary / 20000 non-multiple / 65536 / 262144) |
+| `TestAllreduceOnephaseP4CountSweep` | 4 | onephase | Sum (runtime `count`: 65536, 20000 non-multiple) |
 | `TestAllreduceTwophaseP2MaxMinProd` | 2 | twophase | Max, Min, Prod |
 | `TestAllreduceRingP2MaxMinProd` | 2 | ring | Max, Min, Prod |
 | `TestAllreduceBidirectionalRingRejectNonSum` | 2 | bidirectional_ring (negative: expects `RuntimeError`) | Max |
